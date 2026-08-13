@@ -77,7 +77,13 @@ def get_version():
         # Development version. Get the number of commits after the last release
         git_version = get_git_version()
         print('git describe:', git_version)
-        dev_commits = git_version.split('-')[-2] if git_version else ''
+        # `git describe --always --tags` only yields '<tag>-<commits>-g<sha>' when a tag is
+        # REACHABLE. With no tags in the clone -- the normal case for a fork, since GitHub does
+        # not copy tags, and for any shallow checkout -- `--always` falls back to a bare sha,
+        # which has no '-' to split on and made the [-2] index raise IndexError instead of
+        # reaching the graceful fallback immediately below.
+        describe_parts = git_version.split('-') if git_version else []
+        dev_commits = describe_parts[-2] if len(describe_parts) >= 2 else ''
         if not dev_commits.isdigit():
             print('Error parsing the number of dev commits: %s', dev_commits)
             dev_commits = '0'
