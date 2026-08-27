@@ -343,11 +343,12 @@ AlgorithmStatus AudioLoader::process() {
     }
 
     // read frames until we get a good one
-    do {
+    while (true) {
         int result = av_read_frame(_demuxCtx, &_packet);
         //E_DEBUG(EAlgorithm, "AudioLoader: called av_read_frame(), got result = " << result);
         if (result != 0) {
             // 0 = OK, < 0 = error or EOF
+            // (on error av_read_frame() returns a blank packet, so there is nothing to unref here)
             if (result != AVERROR_EOF) {
                 char errstring[1204];
                 av_strerror(result, errstring, sizeof(errstring));
@@ -368,7 +369,15 @@ AlgorithmStatus AudioLoader::process() {
             }
             return FINISHED;
         }
-    } while (_packet.stream_index != _streamIdx);
+
+        if (_packet.stream_index == _streamIdx) break;
+
+        // The packet belongs to another stream (e.g., a video stream, or an audio stream
+        // other than the selected one). Every packet returned by av_read_frame() owns a
+        // reference to its data buffer, so it must be unreferenced before being discarded,
+        // otherwise its payload leaks for the lifetime of the process (issue #325).
+        av_packet_unref(&_packet);
+    }
 
     // compute md5 first
     if (_computeMD5) {
