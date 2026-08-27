@@ -342,7 +342,18 @@ AlgorithmStatus AudioLoader::process() {
         throw EssentiaException("AudioLoader: Trying to call process() on an AudioLoader algo which hasn't been correctly configured.");
     }
 
-    // read frames until we get a good one
+    // Read packets until we get one from the selected audio stream. The loop is
+    // bounded for any finite input: every iteration consumes one packet from the
+    // demuxer, and av_read_frame() either advances through the file or returns
+    // non-zero (error/EOF), which exits via FINISHED above.
+    //
+    // Shaped as a loop-and-a-half (while/break) rather than the previous
+    // do/while: a foreign packet must be av_packet_unref()'d before the next
+    // read, and av_packet_unref() also resets the packet's fields — including
+    // stream_index, which becomes 0. A bottom-tested do/while condition would
+    // re-read that wiped stream_index and spuriously exit with a blank packet
+    // whenever the selected stream is index 0 (the common case). Testing once,
+    // mid-loop, decides each packet's fate in exactly one place.
     while (true) {
         int result = av_read_frame(_demuxCtx, &_packet);
         //E_DEBUG(EAlgorithm, "AudioLoader: called av_read_frame(), got result = " << result);
