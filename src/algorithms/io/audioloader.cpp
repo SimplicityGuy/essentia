@@ -115,6 +115,13 @@ void AudioLoader::openAudioFile(const string& filename) {
         throw EssentiaException("AudioLoader: Could not copy codec parameters");
     }
 
+    // Tell the decoder what time base the packets we feed it are in. libavcodec needs this to
+    // report frame timestamps correctly -- in particular it advances frame->pts by however many
+    // samples it skipped (codec delay / pre-skip), and that adjustment is expressed in
+    // pkt_timebase. Left unset the adjustment is computed against an invalid time base, so
+    // frame->pts is wrong for every format that carries an encoder delay.
+    _audioCtx->pkt_timebase = _demuxCtx->streams[_streamIdx]->time_base;
+
     if (avcodec_open2(_audioCtx, _audioCodec, NULL) < 0) {
         avcodec_free_context(&_audioCtx);
         throw EssentiaException("AudioLoader: Unable to instantiate codec...");
