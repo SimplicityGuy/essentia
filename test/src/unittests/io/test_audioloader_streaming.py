@@ -143,6 +143,117 @@ class TestAudioLoader_Streaming(TestCase):
         self.compressed(22050, join(mp3path, 'impulses_1second_22050.mp3'))
         self.compressed(22050, join(mp3path, 'impulses_1second_22050_st.mp3'), True)
 
+    # ------------------------------------------------------------------------------------
+    # startTime / endTime -- issue #771
+    #
+    # The reference for all of these is the decode-and-discard path: decode the whole file
+    # and cut the slice out afterwards. That is exactly what a caller had to do before, so
+    # agreeing with it IS the definition of a correct seek. Slices are cut with Trimmer's
+    # seconds -> samples rule, which is the rule the loader uses as well.
+
+    def slice(self, audio, sampleRate, startTime, endTime):
+        return numpy.array(audio)[int(startTime*sampleRate):int(endTime*sampleRate)]
+
+    def seeked(self, filename, startTime, endTime):
+        from essentia.standard import AudioLoader as stdAudioLoader
+        audio, _, _, _, _, _ = stdAudioLoader(filename=filename,
+                                              startTime=startTime,
+                                              endTime=endTime)()
+        return numpy.array(audio)
+
+    def sliceIsExact(self, filename, spans):
+        from essentia.standard import AudioLoader as stdAudioLoader
+        filename = join(testdata.audio_dir, filename)
+        whole, sampleRate, _, _, _, _ = stdAudioLoader(filename=filename)()
+        for startTime, endTime in spans:
+            found = self.seeked(filename, startTime, endTime)
+            expected = self.slice(whole, sampleRate, startTime, endTime)
+            self.assertEqual(len(found), len(expected))
+            self.assert_(numpy.array_equal(found, expected),
+                         'seeking to %s s did not reproduce the decode-and-discard reference'
+                         % startTime)
+
+    def testSeekPcm(self):
+        spans = [(0., 2.), (1., 3.), (12.345, 14.345), (30., 45.)]
+        self.sliceIsExact(join('recorded', 'musicbox.wav'), spans)
+
+    def testSeekFlac(self):
+        self.sliceIsExact(join('recorded', 'dubstep.flac'), [(0., 2.), (1.5, 3.5), (4., 6.)])
+
+    def testSeekMp3(self):
+        self.sliceIsExact(join('recorded', 'techno_loop.mp3'),
+                          [(0., 2.), (1.5, 3.5), (10., 12.), (25., 30.)])
+
+    def testSeekOgg(self):
+        self.sliceIsExact(join('recorded', 'dubstep.ogg'), [(0., 2.), (1.5, 3.5), (4., 6.)])
+
+    def testSeekAac(self):
+        # AAC is the one format a seek cannot reproduce exactly, and it is the codec's doing,
+        # not the loader's: Perceptual Noise Substitution synthesises noise bands from a PRNG
+        # whose state depends on the whole decode history, so a decoder that starts anywhere
+        # but at sample 0 fills those bands with different noise. No amount of preroll fixes
+        # it (the residual is flat from 0.05 s to 10 s of preroll) and it disappears entirely
+        # when the same audio is encoded with -aac_pns 0. The affected bands are synthesised
+        # noise by construction, so this is a documented expectation, not a defect.
+        from essentia.standard import AudioLoader as stdAudioLoader
+        filename = join(testdata.audio_dir, 'recorded', 'dubstep.aac')
+        whole, sampleRate, _, _, _, _ = stdAudioLoader(filename=filename)()
+        for startTime, endTime in [(1.5, 3.5), (4., 6.)]:
+            found = self.seeked(filename, startTime, endTime)
+            expected = self.slice(whole, sampleRate, startTime, endTime)
+            self.assertEqual(len(found), len(expected))
+            self.assertAlmostEqualVectorAbs(found.flatten(), expected.flatten(), 5e-2)
+
+    def testSeekBoundaries(self):
+        from essentia.standard import AudioLoader as stdAudioLoader
+        filename = join(testdata.audio_dir, 'recorded', 'musicbox.wav')
+        whole, sampleRate, _, _, _, _ = stdAudioLoader(filename=filename)()
+        duration = len(whole) / float(sampleRate)
+
+        # startTime 0 with no endTime is the default, and must still read the whole file
+        self.assert_(numpy.array_equal(self.seeked(filename, 0., 1e6), numpy.array(whole)))
+
+        # an endTime past the end of the file simply stops at the end of the file
+        found = self.seeked(filename, duration - 1., duration + 100.)
+        self.assert_(numpy.array_equal(found, self.slice(whole, sampleRate, duration - 1., 1e6)))
+
+        # so does an endTime landing exactly on it
+        self.assert_(numpy.array_equal(self.seeked(filename, 0., duration), numpy.array(whole)))
+
+        # a startTime past the end of the file yields nothing at all, it is not an error
+        self.assertEqual(len(self.seeked(filename, duration + 10., duration + 20.)), 0)
+
+        # neither is an empty slice: startTime == endTime yields no samples
+        self.assertEqual(len(self.seeked(filename, 0., 0.)), 0)
+        self.assertEqual(len(self.seeked(filename, 1., 1.)), 0)
+
+        # an INVERTED slice is an error, as it has always been for the algorithms that
+        # expose these parameters
+        self.assertConfigureFails(sAudioLoader(), {'filename': filename,
+                                                   'startTime': 10., 'endTime': 1.})
+        self.assertConfigureFails(sAudioLoader(), {'filename': filename, 'startTime': -1.})
+        self.assertConfigureFails(sAudioLoader(), {'filename': filename, 'endTime': -1.})
+
+    def testSeekShortFile(self):
+        # a file shorter than the seek preroll must still come back with the right audio
+        from essentia.standard import AudioLoader as stdAudioLoader
+        filename = join(testdata.audio_dir, 'recorded', 'vignesh.wav')
+        whole, sampleRate, _, _, _, _ = stdAudioLoader(filename=filename)()
+        for startTime, endTime in [(0.1, 0.2), (2., 3.), (0.25, 1e6)]:
+            found = self.seeked(filename, startTime, endTime)
+            expected = self.slice(whole, sampleRate, startTime, endTime)
+            self.assertEqual(len(found), len(expected))
+            self.assert_(numpy.array_equal(found, expected))
+
+    def testSeekedMD5(self):
+        # a slice does not read the whole payload, so its md5 cannot be the file's md5;
+        # report nothing rather than a checksum that means nothing.
+        from essentia.standard import AudioLoader as stdAudioLoader
+        filename = join(testdata.audio_dir, 'recorded', 'dubstep.wav')
+        _, _, _, md5, _, _ = stdAudioLoader(filename=filename, computeMD5=True,
+                                            startTime=1., endTime=2.)()
+        self.assertEqual(md5, '')
+
     def testInvalidFile(self):
         for ext in ['wav', 'aiff', 'flac', 'mp3', 'ogg']:
             self.assertRaises(RuntimeError, lambda: sAudioLoader(filename='unknown.'+ext))
