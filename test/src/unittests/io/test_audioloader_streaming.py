@@ -187,6 +187,85 @@ class TestAudioLoader_Streaming(TestCase):
     def testSeekOgg(self):
         self.sliceIsExact(join('recorded', 'dubstep.ogg'), [(0., 2.), (1.5, 3.5), (4., 6.)])
 
+    def testSeekOggOpus(self):
+        # Regression test for upstream issue 1531 (MTG/essentia): AudioLoader must set
+        # AVCodecContext::pkt_timebase before avcodec_open2(). libavcodec expresses the
+        # frame->pts adjustment it makes after discarding a codec's initial padding in
+        # pkt_timebase; left at its 0/1 default the adjustment is silently skipped, and on
+        # Ogg/Opus every decoded frame's pts is short by exactly the 312-sample pre-skip
+        # Opus mandates at 48 kHz. Nothing consumes frame->pts except the post-seek anchor,
+        # so the symptom is a slice shifted by exactly +312 samples whenever startTime > 0
+        # on an Opus file -- which is what this test pins down.
+        #
+        # The test-audio collection has no Opus file, so the fixture is generated here with
+        # the ffmpeg CLI: a phase-continuous 997 Hz sine at Opus's native 48 kHz, on which
+        # any misalignment produces an unambiguous, large amplitude error. Skipped cleanly
+        # when no ffmpeg CLI or no Opus encoder is available.
+        import os
+        import shutil
+        import subprocess
+        import tempfile
+
+        ffmpeg = shutil.which('ffmpeg')
+        if ffmpeg is None:
+            self.skipTest('no ffmpeg CLI available to generate an Ogg/Opus fixture')
+
+        tmpdir = tempfile.mkdtemp(suffix='_essentia_opus')
+        try:
+            filename = os.path.join(tmpdir, 'sine48k.opus')
+            source = ['-f', 'lavfi',
+                      '-i', 'sine=frequency=997:sample_rate=48000:duration=10']
+            encoders = [['-c:a', 'libopus', '-b:a', '128k'],
+                        ['-c:a', 'opus', '-strict', 'experimental', '-b:a', '128k']]
+            for encoder in encoders:
+                result = subprocess.run([ffmpeg, '-v', 'error', '-y'] + source +
+                                        encoder + [filename],
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    break
+            else:
+                self.skipTest('ffmpeg CLI has no usable Opus encoder')
+
+            from essentia.standard import AudioLoader as stdAudioLoader
+            whole, sampleRate, _, _, _, _ = stdAudioLoader(filename=filename)()
+            self.assertEqual(sampleRate, 48000)
+
+            for startTime, endTime in [(5., 7.), (1.5, 3.5)]:
+                found = self.seeked(filename, startTime, endTime)
+                expected = self.slice(whole, sampleRate, startTime, endTime)
+                self.assertEqual(len(found), len(expected))
+                # Not array_equal: the Opus decoder's post-seek convergence leaves a 1-ULP
+                # (~1.5e-8) residual over the first ~60 ms of a slice, which is the codec's
+                # doing, not the loader's. 2e-7 absorbs that and nothing else: a slice
+                # shifted by the 312-sample pre-skip differs from the reference by O(1)
+                # amplitude on this sine, seven orders of magnitude above the bound.
+                maxdiff = numpy.max(numpy.abs(found.astype(numpy.float64) -
+                                              expected.astype(numpy.float64)))
+                self.assert_(maxdiff <= 2e-7,
+                             'seeking to %s s in an Ogg/Opus file did not reproduce the '
+                             'decode-and-discard reference (max amplitude error %g, '
+                             'misaligned by %s samples); is AVCodecContext::pkt_timebase '
+                             'set? (upstream issue 1531)'
+                             % (startTime, maxdiff, self.measuredLag(found, expected)))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def measuredLag(self, found, expected, maxLag=1000):
+        # Diagnostic only (used in failure messages): the lag k minimizing the mean absolute
+        # difference between found[k:...] and expected, scanned over +/- maxLag samples.
+        # A pkt_timebase regression shows up here as exactly the Opus pre-skip, +312.
+        a = numpy.array(found)[:, 0].astype(numpy.float64)
+        b = numpy.array(expected)[:, 0].astype(numpy.float64)
+        n = min(len(a), len(b)) - maxLag
+        if n <= maxLag: return 'unknown'
+        best, bestErr = 0, None
+        for k in range(-maxLag, maxLag + 1):
+            if k >= 0: err = numpy.abs(a[k:k+n-maxLag] - b[:n-maxLag]).mean()
+            else:      err = numpy.abs(a[:n-maxLag] - b[-k:-k+n-maxLag]).mean()
+            if bestErr is None or err < bestErr: best, bestErr = k, err
+        return best
+
     def testSeekAac(self):
         # AAC is the one format a seek cannot reproduce exactly, and it is the codec's doing,
         # not the loader's: Perceptual Noise Substitution synthesises noise bands from a PRNG
