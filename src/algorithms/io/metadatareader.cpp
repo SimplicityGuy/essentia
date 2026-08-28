@@ -280,13 +280,10 @@ namespace standard {
 
 const char* MetadataReader::name = "MetadataReader";
 const char* MetadataReader::category = "Input/output";
-const char* MetadataReader::description = DOC("This algorithm loads the metadata tags from an audio file as well as outputs its audio properties. Supported audio file types are:\n"
-"  - mp3\n"
-"  - flac\n"
-"  - ogg\n"
-"An exception is thrown if unsupported filetype is given or if the file does not exist.\n"
-"For audio files that the linked TagLib version cannot parse (e.g., Matroska containers require TagLib >= 2.2), the audio properties (duration, bitrate, sample rate, channels) and the metadata tags are read with FFmpeg's libavformat instead, when Essentia is built with FFmpeg support.\n"
-"Please observe that the .wav format is not supported. Also note that this algorithm incorrectly calculates the number of channels for a file in mp3 format only for versions less than 1.5 of taglib in Linux and less or equal to 1.5 in Mac OS X\n"
+const char* MetadataReader::description = DOC("This algorithm loads the metadata tags from an audio file as well as outputs its audio properties. Tags and audio properties are read with TagLib for the file types it supports (mp3, ogg, flac, mp4/m4a, and others). When TagLib cannot parse a file, two fallbacks apply in order:\n"
+"  - raw PCM files (.wav, .aiff) are handled by a built-in header reader that outputs audio properties only (no tags);\n"
+"  - any other file type falls back to FFmpeg's libavformat, which reads both the audio properties (duration, bitrate, sample rate, channels) and the metadata tags, when Essentia is built with FFmpeg support (e.g., Matroska containers require TagLib >= 2.2 to be read natively).\n"
+"An exception is thrown if the file does not exist. If no available reader can parse the file, an exception is thrown when 'failOnError' is enabled; otherwise all outputs are left empty or zero.\n"
 "If using this algorithm on Windows, you must ensure that the filename is encoded as UTF-8.\n"
 "This algorithm also contains some heuristic to try to deal with encoding errors in the tags and tries to do the appropriate conversion if a problem was found (mostly twice latin1->utf8 conversion).\n"
 "\n"
