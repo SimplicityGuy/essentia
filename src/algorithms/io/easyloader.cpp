@@ -61,7 +61,8 @@ void EasyLoader::configure() {
   _monoLoader->configure(INHERIT("filename"),
                          INHERIT("sampleRate"),
                          INHERIT("downmix"),
-                         INHERIT("audioStream"));
+                         INHERIT("audioStream"),
+                         INHERIT("gapless"));
 
   Parameter originalSampleRate = _monoLoader->parameter("originalSampleRate");
   _params.add("originalSampleRate", originalSampleRate);
@@ -88,7 +89,8 @@ void EasyLoader::configure() {
                            INHERIT("downmix"),
                            INHERIT("audioStream"),
                            INHERIT("startTime"),
-                           INHERIT("endTime"));
+                           INHERIT("endTime"),
+                           INHERIT("gapless"));
 
     // The loader already delivered exactly the requested slice.
     _trimmer->configure("sampleRate", parameter("sampleRate"),
@@ -120,6 +122,11 @@ const char* EasyLoader::description = DOC("This algorithm loads the raw audio da
 "\n"
 "This algorithm uses MonoLoader and therefore inherits all of its input requirements and exceptions.\n"
 "\n"
+"The 'gapless' parameter is handed to AudioLoader and decides whether the encoder delay "
+"and padding that lossy codecs add at both ends of the signal are trimmed; the default "
+"trims exactly what the file declares. See AudioLoader for what each value means."
+"\n"
+"\n"
 "References:\n"
 "  [1] Replay Gain - A Proposed Standard,\n"
 "  http://replaygain.hydrogenaudio.org");
@@ -146,7 +153,8 @@ void EasyLoader::configure() {
                      INHERIT("endTime"),
                      INHERIT("replayGain"),
                      INHERIT("downmix"),
-                     INHERIT("audioStream"));
+                     INHERIT("audioStream"),
+                     INHERIT("gapless"));
 }
 
 void EasyLoader::compute() {

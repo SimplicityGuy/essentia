@@ -56,8 +56,26 @@ void AudioLoader::configure() {
         throw EssentiaException("AudioLoader: 'startTime' cannot be larger than 'endTime'");
     }
 
+    string gapless = parameter("gapless").toLower();
+    if      (gapless == "none")    _gapless = GAPLESS_NONE;
+    else if (gapless == "decoder") _gapless = GAPLESS_DECODER;
+    else                           _gapless = GAPLESS_METADATA;
+
     reset();
 }
+
+
+// Samples of latency inherent to an MPEG-1/2 Layer III decoder: the synthesis polyphase
+// filterbank and the MDCT overlap together delay the output by 528 + 1 samples before the
+// first encoded sample appears. It is a property of the decoder, not of the file, so every
+// Layer III decoder (LAME's, and libavcodec's) shows it -- which is why an mp3 that DOES carry
+// a Xing/LAME header has 529 added to the encoder delay recorded there.
+//
+// Measured, not assumed: decoding a 2 s file whose LAME header declares a 576-sample encoder
+// delay, ffmpeg drops 1105 = 576 + 529 samples and the result is sample-aligned with the
+// original wav. Stripping the header from the same file removes the trim and reintroduces
+// exactly those 1105 samples of offset, of which 529 disappear again by dropping this constant.
+static const int64_t MPEG_LAYER3_DECODER_DELAY = 529;
 
 
 // How much audio to decode-and-discard BEFORE the requested startTime.
@@ -102,10 +120,23 @@ void AudioLoader::seekToStartTime() {
     // whose 24-bit mantissa cannot represent every sample index past ~380 s at 44.1 kHz; doing
     // it in double here removes that drift, so a slice taken deep into a long file lands where
     // the parameters say it should.)
-    _startSample = (int64_t)((double)_startTime * sampleRate);
-    _endSample   = (_endTime >= 1.0e6) ? -1 : (int64_t)((double)_endTime * sampleRate);
+    // _decoderDelay shifts the whole requested window: in GAPLESS_DECODER mode we have decided
+    // that the stream's true sample 0 lies that many samples into what the decoder hands us, so
+    // "second T" is at T*rate + _decoderDelay of decoder output. Both bounds move together, and
+    // the trimming itself then falls out of the existing skip logic in copyFFmpegOutput().
+    _startSample = (int64_t)((double)_startTime * sampleRate) + _decoderDelay;
+    _endSample   = (_endTime >= 1.0e6) ? -1 : (int64_t)((double)_endTime * sampleRate) + _decoderDelay;
 
-    if (_startSample <= 0) return;   // nothing to seek to
+    // Seek only when the caller actually asked for a later start. A _decoderDelay of a few
+    // hundred samples is not worth a seek -- copyFFmpegOutput() drops it from the first frames.
+    if (_startTime <= 0) return;
+
+    // gapless="none" deliberately keeps the encoder delay, so its sample 0 is the encoder delay
+    // EARLIER than the timeline the frame timestamps are stated on -- anchoring on a pts after a
+    // seek would place the slice by that much. Positions in this mode mean positions in the raw
+    // decoder output, so take the decode-and-discard path below instead: slower, but it counts
+    // the samples we actually emit and so lands exactly where the parameters say.
+    if (_gapless == GAPLESS_NONE) return;
 
     AVStream* stream = _demuxCtx->streams[_streamIdx];
 
@@ -236,6 +267,15 @@ void AudioLoader::openAudioFile(const string& filename) {
     // frame->pts is wrong for every format that carries an encoder delay.
     _audioCtx->pkt_timebase = _demuxCtx->streams[_streamIdx]->time_base;
 
+    // Gapless trimming is libavcodec's default: the demuxer reads the encoder delay and padding
+    // out of the container (the Xing/LAME header for mp3, the edit list for m4a, the pre-skip
+    // for opus) and hands them to the decoder as AV_PKT_DATA_SKIP_SAMPLES side data, which the
+    // decoder applies before we ever see the frame. AV_CODEC_FLAG2_SKIP_MANUAL turns that off
+    // and gives us the raw output instead, which is what gapless="none" asks for.
+    if (_gapless == GAPLESS_NONE) {
+        _audioCtx->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+    }
+
     if (avcodec_open2(_audioCtx, _audioCodec, NULL) < 0) {
         avcodec_free_context(&_audioCtx);
         throw EssentiaException("AudioLoader: Unable to instantiate codec...");
@@ -274,6 +314,21 @@ void AudioLoader::openAudioFile(const string& filename) {
     }
 
     av_md5_init(_md5Encoded);
+
+    // An mp3 that carries a Xing/LAME header gets its encoder delay reported by the demuxer as a
+    // non-zero stream start_time (it is the same number the decoder skips), so a start_time of
+    // zero on an mp3 means the file declares nothing and libavcodec has trimmed nothing. That is
+    // the only case where gapless="decoder" has anything to add: the encoder delay is
+    // unrecoverable without the header, but the decoder's own latency is a constant we know.
+    // Restricted to Layer III on purpose -- the constant is Layer III's, not Layer I's or II's.
+    _decoderDelay = 0;
+    if (_gapless == GAPLESS_DECODER) {
+        const AVStream* stream = _demuxCtx->streams[_streamIdx];
+        bool delayDeclared = (stream->start_time != AV_NOPTS_VALUE && stream->start_time > 0);
+        if (_audioCtx->codec_id == AV_CODEC_ID_MP3 && !delayDeclared) {
+            _decoderDelay = MPEG_LAYER3_DECODER_DELAY;
+        }
+    }
 
     // Everything above is stream setup; the file is now positioned at the start. If the caller
     // asked for a later startTime, move there NOW rather than making process() read past it.
@@ -705,6 +760,17 @@ const char* AudioLoader::description = DOC("This algorithm loads the single audi
 "This algorithm will throw an exception if it was not properly configured which is normally due to not specifying a valid filename. Invalid names comprise those with extensions different than the supported  formats and non existent files. If using this algorithm on Windows, you must ensure that the filename is encoded as UTF-8\n\n"
 "Note: ogg files are decoded in reverse phase, due to be using ffmpeg library.\n"
 "\n"
+"Lossy codecs do not encode an exact number of samples: the encoder prepends a delay and appends "
+"padding so that the signal fills a whole number of coded frames, and a decoder that ignores them "
+"returns audio that is time-shifted and zero-padded with respect to what was encoded. By default "
+"('gapless' = \"metadata\") this algorithm trims exactly the delay and padding the file declares "
+"-- the Xing/LAME header of an mp3, the edit list of an m4a, the pre-skip of an opus stream -- so "
+"the first output sample is the first sample that was encoded and the output length matches the "
+"original. An mp3 written without a Xing/LAME header declares nothing and cannot be fully "
+"corrected; 'gapless' = \"decoder\" removes the decoder's own 529-sample latency from those files, "
+"leaving only the encoder's share of the shift. 'gapless' = \"none\" reproduces the untrimmed "
+"output of a decoder that ignores this metadata altogether.\n"
+"\n"
 "References:\n"
 "  [1] WAV - Wikipedia, the free encyclopedia,\n"
 "      http://en.wikipedia.org/wiki/Wav\n"
@@ -736,7 +802,8 @@ void AudioLoader::configure() {
                        INHERIT("computeMD5"),
                        INHERIT("audioStream"),
                        INHERIT("startTime"),
-                       INHERIT("endTime"));
+                       INHERIT("endTime"),
+                       INHERIT("gapless"));
 }
 
 void AudioLoader::compute() {

@@ -57,7 +57,8 @@ void EqloudLoader::configure() {
 
   _monoLoader->configure(INHERIT("filename"),
                          INHERIT("sampleRate"),
-                         INHERIT("downmix"));
+                         INHERIT("downmix"),
+                         INHERIT("gapless"));
 
   // Same change, and the same one exception, as EasyLoader::configure() -- see the comment
   // there. The loader seeks to startTime and stops at endTime unless a resampler is in the way,
@@ -68,7 +69,8 @@ void EqloudLoader::configure() {
                            INHERIT("sampleRate"),
                            INHERIT("downmix"),
                            INHERIT("startTime"),
-                           INHERIT("endTime"));
+                           INHERIT("endTime"),
+                           INHERIT("gapless"));
 
     _trimmer->configure("sampleRate", parameter("sampleRate"),
                         "startTime", 0.0,
@@ -100,6 +102,10 @@ const char* EqloudLoader::description = DOC("This algorithm loads the raw audio 
 "\n"
 "This algorithm uses MonoLoader and thus inherits all of its input requirements and exceptions.\n"
 "\n"
+"The 'gapless' parameter is handed to AudioLoader and decides whether the encoder delay "
+"and padding that lossy codecs add at both ends of the signal are trimmed; the default "
+"trims exactly what the file declares. See AudioLoader for what each value means.\n"
+"\n"
 "References:\n"
 "  [1] Replay Gain - A Proposed Standard,\n"
 "  http://replaygain.hydrogenaudio.org\n"
@@ -127,7 +133,8 @@ void EqloudLoader::configure() {
                      INHERIT("startTime"),
                      INHERIT("endTime"),
                      INHERIT("replayGain"),
-                     INHERIT("downmix"));
+                     INHERIT("downmix"),
+                     INHERIT("gapless"));
 }
 
 void EqloudLoader::compute() {

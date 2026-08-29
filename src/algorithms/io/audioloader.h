@@ -76,6 +76,15 @@ class AudioLoader : public Algorithm {
   bool _anchorPending;      // true right after a seek: adopt the next frame's pts as position
   bool _reachedEndTime;     // set once _endSample has been produced
 
+  // --- gapless handling of encoder delay / padding (issue #686) --------------------------
+  enum GaplessMode {
+    GAPLESS_NONE,      // hand back the raw decoder output, delay and padding included
+    GAPLESS_METADATA,  // trim exactly what the container/codec declares (default)
+    GAPLESS_DECODER    // as METADATA, plus the decoder's own latency when nothing is declared
+  };
+  GaplessMode _gapless;
+  int64_t _decoderDelay;    // samples of pure decoder latency to drop, GAPLESS_DECODER only
+
   void openAudioFile(const std::string& filename);
   void closeAudioFile();
   void seekToStartTime();
@@ -95,7 +104,8 @@ class AudioLoader : public Algorithm {
 	          _audioCtx(0), _audioCodec(0), _decodedFrame(0),
             _convertCtxAv(0), _configured(false),
             _startTime(0), _endTime(0), _startSample(0), _endSample(-1),
-            _currentSample(0), _anchorPending(false), _reachedEndTime(false) {
+            _currentSample(0), _anchorPending(false), _reachedEndTime(false),
+            _gapless(GAPLESS_METADATA), _decoderDelay(0) {
 
     declareOutput(_audio, 1, "audio", "the input audio signal");
     declareOutput(_sampleRate, 0, "sampleRate", "the sampling rate of the audio signal [Hz]");
@@ -132,6 +142,7 @@ class AudioLoader : public Algorithm {
     declareParameter("audioStream", "audio stream index to be loaded. Other streams are not taken into account (e.g. if stream 0 is video and 1 is audio use index 0 to access it.)", "[0,inf)", 0);
     declareParameter("startTime", "the start time of the slice to be extracted [s]. The decoder SEEKS to this position instead of decoding and discarding the audio before it.", "[0,inf)", 0.0);
     declareParameter("endTime", "the end time of the slice to be extracted [s]. Decoding stops here instead of continuing to the end of the stream.", "[0,inf)", 1.0e6);
+    declareParameter("gapless", "how to handle the encoder delay and padding that lossy codecs add at the beginning and the end of the decoded signal. \"metadata\" trims exactly the amount the container declares (e.g. the Xing/LAME header of an mp3), which is what a gapless player does and leaves the output sample-aligned with the signal that was encoded. \"decoder\" additionally drops the decoder's own constant latency (529 samples for MPEG Layer III) on streams that declare nothing, removing the decoder's share of the shift but not the encoder's. \"none\" returns the raw decoder output, delay and padding included; 'startTime' and 'endTime' then refer to positions in that raw output, which the decoder reaches by decoding and discarding rather than by seeking.", "{none,metadata,decoder}", "metadata");
   }
 
   void configure();
@@ -195,6 +206,7 @@ class AudioLoader : public Algorithm {
     declareParameter("audioStream", "audio stream index to be loaded. Other streams are no taken into account (e.g. if stream 0 is video and 1 is audio use index 0 to access it.)", "[0,inf)", 0);
     declareParameter("startTime", "the start time of the slice to be extracted [s]. The decoder SEEKS to this position instead of decoding and discarding the audio before it.", "[0,inf)", 0.0);
     declareParameter("endTime", "the end time of the slice to be extracted [s]. Decoding stops here instead of continuing to the end of the stream.", "[0,inf)", 1.0e6);
+    declareParameter("gapless", "how to handle the encoder delay and padding that lossy codecs add at the beginning and the end of the decoded signal. \"metadata\" trims exactly the amount the container declares (e.g. the Xing/LAME header of an mp3), which is what a gapless player does and leaves the output sample-aligned with the signal that was encoded. \"decoder\" additionally drops the decoder's own constant latency (529 samples for MPEG Layer III) on streams that declare nothing, removing the decoder's share of the shift but not the encoder's. \"none\" returns the raw decoder output, delay and padding included; 'startTime' and 'endTime' then refer to positions in that raw output, which the decoder reaches by decoding and discarding rather than by seeking.", "{none,metadata,decoder}", "metadata");
   }
 
   void configure();
