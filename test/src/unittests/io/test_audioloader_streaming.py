@@ -346,6 +346,103 @@ class TestAudioLoader_Streaming(TestCase):
         self.assertEqual(md5_ogg, "a87dad40fea0966cc5b967d5412e8868")
         self.assertEqual(md5_aac, "9a4c7f0da68d4b58767f219c48014f9c")
 
+    # ------------------------------------------------------------------------------------
+    # gapless -- issue #686
+    #
+    # A lossy encoder does not encode an exact number of samples: it prepends a delay and
+    # appends padding so the signal fills whole coded frames, and records how much in the
+    # container (the Xing/LAME header of an mp3). Decoding without honouring that returns
+    # audio that is time-shifted and zero-padded relative to what was encoded.
+    #
+    # libavcodec honours it by default, so the loader has always to trim exactly the declared
+    # amount and nothing else. These tests pin that down: the trimmed decode must be a
+    # contiguous piece of the untrimmed one (gapless="none"), never a resynthesis of it.
+
+    def loadGapless(self, filename, gapless, **kwargs):
+        from essentia.standard import AudioLoader as stdAudioLoader
+        audio, _, _, _, _, _ = stdAudioLoader(filename=join(testdata.audio_dir, filename),
+                                              gapless=gapless, **kwargs)()
+        return numpy.array(audio)
+
+    def headTrim(self, raw, trimmed, limit=4096):
+        # Offset at which `trimmed` starts inside `raw`, or None if it is not a piece of it.
+        # The probe is taken from the middle rather than the head: a window of decoded audio
+        # cannot match at the wrong offset by accident, whereas a window of leading silence
+        # very nearly could.
+        mid = len(trimmed) // 2
+        probe = trimmed[mid:mid + 2048]
+        for offset in range(limit):
+            if numpy.array_equal(raw[mid + offset:mid + offset + 2048], probe):
+                return offset
+        return None
+
+    def testGaplessIsAPureTrim(self):
+        # This file is the one testMp3TimeShift uses: its impulses land where the wav's do,
+        # which is only possible because it declares its encoder delay and that delay is
+        # being honoured. So it is a file we know has something to trim.
+        filename = join('generated', 'synthesised', 'impulse', 'mp3',
+                        'impulses_1second_44100.mp3')
+        raw = self.loadGapless(filename, 'none')
+        trimmed = self.loadGapless(filename, 'metadata')
+
+        self.assert_(len(trimmed) < len(raw),
+                     'the default decode should be shorter than the untrimmed one')
+
+        offset = self.headTrim(raw, trimmed)
+        self.assert_(offset is not None,
+                     'the trimmed decode is not a contiguous piece of the raw one')
+        self.assert_(offset > 0, 'no encoder delay was trimmed from the head')
+        self.assert_(numpy.array_equal(trimmed, raw[offset:offset + len(trimmed)]),
+                     'trimming altered samples instead of only dropping them')
+        # what is left over past the end of the slice is the trailing padding
+        self.assert_(len(raw) - offset - len(trimmed) > 0,
+                     'no padding was trimmed from the tail')
+
+    def testGaplessDefaultIsMetadata(self):
+        # Every recorded expected output in this suite was produced without the parameter,
+        # so the default has to stay exactly what the loader did before it existed.
+        from essentia.standard import AudioLoader as stdAudioLoader
+        filename = join('generated', 'synthesised', 'impulse', 'mp3',
+                        'impulses_1second_44100.mp3')
+        default, _, _, _, _, _ = stdAudioLoader(
+            filename=join(testdata.audio_dir, filename))()
+        self.assert_(numpy.array_equal(numpy.array(default),
+                                       self.loadGapless(filename, 'metadata')),
+                     'the default must keep behaving as gapless="metadata"')
+
+    def testGaplessLosslessUnaffected(self):
+        # Lossless formats carry no encoder delay, so every mode must return the same audio.
+        for filename in [join('recorded', 'musicbox.wav'),
+                         join('recorded', 'dubstep.flac')]:
+            metadata = self.loadGapless(filename, 'metadata')
+            self.assert_(numpy.array_equal(self.loadGapless(filename, 'none'), metadata),
+                         'gapless changed the decode of %s' % filename)
+            self.assert_(numpy.array_equal(self.loadGapless(filename, 'decoder'), metadata),
+                         'gapless changed the decode of %s' % filename)
+
+    def testGaplessSeekConsistency(self):
+        # Whatever the mode, a seeked slice must still reproduce the decode-and-discard
+        # reference taken from the whole decode in that SAME mode -- the trim shifts the
+        # timeline, it does not make positions mean something different from one call to the
+        # next.
+        from essentia.standard import AudioLoader as stdAudioLoader
+        filename = join('recorded', 'techno_loop.mp3')
+        _, sampleRate, _, _, _, _ = stdAudioLoader(
+            filename=join(testdata.audio_dir, filename))()
+        for gapless in ['none', 'metadata', 'decoder']:
+            whole = self.loadGapless(filename, gapless)
+            for startTime, endTime in [(1.5, 3.5), (10., 12.)]:
+                found = self.loadGapless(filename, gapless,
+                                         startTime=startTime, endTime=endTime)
+                expected = self.slice(whole, sampleRate, startTime, endTime)
+                self.assertEqual(len(found), len(expected))
+                self.assert_(numpy.array_equal(found, expected),
+                             'gapless="%s" moved the slice at %s s' % (gapless, startTime))
+
+    def testGaplessInvalidValue(self):
+        filename = join(testdata.audio_dir, 'recorded', 'techno_loop.mp3')
+        self.assertConfigureFails(sAudioLoader(), {'filename': filename, 'gapless': 'full'})
+
     def testMultiStream(self):
 
         #  stream 0 of multistream1.mka is the same as stream 1 of multistream2.mka

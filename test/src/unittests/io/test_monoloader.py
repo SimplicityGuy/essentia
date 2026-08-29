@@ -139,25 +139,41 @@ class TestMonoLoader(TestCase):
         self.assertEqual(self.sum(right), 9)
         self.assertEqual(self.sum(mix), 9)
 
+    def firstImpulse(self, signal):
+        for x in range(len(signal)):
+            if signal[x] > 0.9:
+                return x
+        self.assert_(False, 'no impulse found in the signal')
+
     def testMp3TimeShift(self):
-        # test mp3s are loaded with no time shift (lost frames)
+        # Issue #686: an mp3 decoded without regard for the encoder delay and padding starts
+        # 1105 samples late -- 576 samples of LAME encoder delay plus the 529 samples of
+        # latency every Layer III decoder has. That was Essentia's behaviour with the libav
+        # of 2.1_beta2, and 1105 is the shift this very file used to show.
+        #
+        # libavcodec now reads the delay out of the file's Xing/LAME header and drops it
+        # before the audio reaches us, which is what 'gapless' selects between: the default
+        # "metadata" keeps that (no shift), "none" turns it off and brings the 1105 back.
         filename_mp3 = join(mp3_dir, 'impulses_1second_44100.mp3')
         filename_wav = join(wav_dir, 'impulses_1second_44100.wav')
-        mp3 = self.load(filename_mp3, 'mix', 44100)
-        wav = self.load(filename_wav, 'mix', 44100)
+        wav = self.firstImpulse(self.load(filename_wav, 'mix', 44100))
 
-        # find time shift between impulse positions
-        impulses_mp3 = [x for x in range(len(mp3)) if mp3[x]>0.9]
-        impulses_wav = [x for x in range(len(wav)) if wav[x]>0.9]
+        trimmed = MonoLoader(filename=filename_mp3, downmix='mix', sampleRate=44100)()
+        self.assertEqual(self.firstImpulse(trimmed) - wav, 0)
 
-        shift = impulses_mp3[0] - impulses_wav[0]
-        # FIXME:
-        # For this particular audio files in essentia 2.1_beta2 with an older libav version
-        # the expected shift was 1105 samples, however now there is no shift
-        # Nevertheless time shift can be observed on other examples but we still do not have such tests 
+        raw = MonoLoader(filename=filename_mp3, downmix='mix', sampleRate=44100,
+                         gapless='none')()
+        self.assertEqual(self.firstImpulse(raw) - wav, 1105)
 
-        #self.assertEqual(abs(shift), 1105)
-        self.assertEqual(abs(shift), 0)
+        # The file declares its delay, so there is nothing left for "decoder" to compensate
+        # and it must agree with the default sample for sample.
+        decoder = MonoLoader(filename=filename_mp3, downmix='mix', sampleRate=44100,
+                             gapless='decoder')()
+        self.assertEqualVector(decoder, trimmed)
+
+    def testGaplessInvalidParam(self):
+        filename = join(mp3_dir, 'impulses_1second_44100.mp3')
+        self.assertConfigureFails(MonoLoader(), {'filename': filename, 'gapless': 'yes'})
 
 
 ###############
