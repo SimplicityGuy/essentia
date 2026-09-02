@@ -1,3 +1,28 @@
+# essentia-tensorflow wheels.
+#
+# These wheels ship the TensorFlow C library inside the wheel. Installing one is
+# all a user does: there is no `tensorflow` pip package to install alongside it,
+# and no interpreter is excluded because upstream TensorFlow does not publish a
+# wheel for it.
+#
+# What changed is only where the library comes from. It used to be a Bazel-built
+# libtensorflow 2.5 baked into the Linux builder image, and `brew install
+# tensorflow` on macOS. The Homebrew bottle is the reason MACOSX_DEPLOYMENT_TARGET
+# had been raised to 26.2 -- delocate takes the highest minimum OS version of
+# everything it vendors -- which in turn made the x86_64 wheel uninstallable on
+# the runner that built it and left its test-command commented out.
+#
+# packaging/fetch_libtensorflow.sh now installs a prebuilt library per platform,
+# from pins in packaging/build_config.sh: Google's official libtensorflow-cpu
+# tarballs on macOS, whose minimum OS versions are 12.0 and 10.15 and so impose
+# no floor of their own, and Homebrew's Linux bottles, which are the only
+# prebuilt libtensorflow still published for aarch64. It writes a tensorflow.pc,
+# and `waf configure --with-tensorflow` then proves the C API links before
+# anything is built.
+#
+# The repair step is the stock one, with no --exclude: auditwheel and delocate
+# vendor libtensorflow exactly as they vendor FFmpeg and the rest.
+
 [tool.cibuildwheel.linux]
 
 manylinux-x86_64-image = "mtgupf/essentia-builds:manylinux2014_x86_64"
@@ -21,6 +46,25 @@ environment = { PROJECT_NAME="essentia-tensorflow", ESSENTIA_PROJECT_NAME="${PRO
 
 # Use system's Python3 to build Essentia.
 before-all = [
+  # Installs into /usr/local, which is the only directory on the image's
+  # PKG_CONFIG_PATH, and removes the image's Bazel-built libtensorflow 2.5 --
+  # headers, libraries and .pc -- on its way in, so there is exactly one
+  # TensorFlow on the system and no question about which one was linked.
+  "bash packaging/fetch_libtensorflow.sh --prefix /usr/local",
+  # The builder image's FFmpeg .pc files carry -latomic, and this toolchain
+  # links with --no-as-needed, so the Python extension comes out with a NEEDED
+  # on libtensorflow's neighbour libatomic.so.1 whether or not it uses it. It
+  # does not: `nm -D --undefined-only` on the built extension finds no __atomic_*
+  # or libat_* symbol at all. auditwheel then leaves libatomic external, because
+  # it is on the manylinux policy allowlist, and the wheel dies at import on any
+  # image without libatomic1 -- python:3.x-slim, for one. Drop the flag.
+  #
+  # The aarch64 build solves the same problem in packaging/build_ffmpeg.sh by
+  # rewriting -latomic to -l:libatomic.a, which is not available here: these .pc
+  # files come from the image rather than from our scripts, and the devtoolset-10
+  # libatomic.a is not built PIC, so linking it into a shared object fails with
+  # "relocation R_X86_64_32 against hidden symbol ... can not be used".
+  "sed -i -e 's/ -latomic//g' /usr/local/lib/pkgconfig/lib*.pc",
   "python3 waf configure --with-gaia --with-tensorflow --build-static --static-dependencies --pkg-config-path=\"${PKG_CONFIG_PATH}\"",
   "python3 waf",
   "python3 waf install",
@@ -37,25 +81,24 @@ test-command = "python -c 'import essentia; import essentia.standard; import ess
 # See linux section for skip rationale.
 skip = ["*cp38*", "*t-*"]
 
-environment = { PROJECT_NAME="essentia-tensorflow", ESSENTIA_PROJECT_NAME="${PROJECT_NAME}", ESSENTIA_WHEEL_SKIP_3RDPARTY=1, ESSENTIA_WHEEL_ONLY_PYTHON=1, MACOSX_DEPLOYMENT_TARGET=15.2 }
+# MACOSX_DEPLOYMENT_TARGET matches cibuildwheel.toml. It no longer has to follow
+# whatever floor a Homebrew libtensorflow bottle was last built with, because the
+# library now comes from the official tarball, built at 10.15 on this platform.
+#
+# PKG_CONFIG_PATH is prepended to pkg-config's own search path, which is how the
+# Homebrew .pc files for eigen, FFmpeg and the rest keep being found. Note that
+# the configure below deliberately does NOT pass --pkg-config-path: that option
+# also sets PKG_CONFIG_LIBDIR, which would replace the default search path
+# instead of extending it and hide every Homebrew dependency.
+environment = { PROJECT_NAME="essentia-tensorflow", ESSENTIA_PROJECT_NAME="${PROJECT_NAME}", ESSENTIA_WHEEL_SKIP_3RDPARTY=1, ESSENTIA_WHEEL_ONLY_PYTHON=1, MACOSX_DEPLOYMENT_TARGET=15.0, PKG_CONFIG_PATH="$HOME/libtensorflow/lib/pkgconfig" }
 
 before-all = [
   "brew install pkg-config gcc readline sqlite gdbm freetype libpng",
   "brew install eigen libyaml fftw ffmpeg libsamplerate libtag",
   "brew install chromaprint",
-  # Delocate checks for the min OS version (LC_BUILD_VERSION or C_VERSION_MIN_MACOSX).
-  # Tensorflow bottle has a minimum target of 15.2 which is too new.
-  # We could build from source as a workaround, however, it takes too much time on the CI worker.
-  # To keep it simple, just use the bottles available for tensorflow.
-  "brew install tensorflow",
-  # ---
-  # Building tensorflow from source:
-  #"echo Checking available SDKs:",
-  #"xcodebuild -showsdks",
-  #"SDKROOT=$(xcrun --sdk macosx13.0 --show-sdk-path) brew install --build-from-source tensorflow",
-  # ---
+  "bash packaging/fetch_libtensorflow.sh --prefix \"$HOME/libtensorflow\"",
   # Override VIRTUAL_ENV set by cibuildwheel to ensure global install
-  "VIRTUAL_ENV=/usr/local python waf configure --with-tensorflow --pkg-config-path=\"${PKG_CONFIG_PATH}\"",
+  "VIRTUAL_ENV=/usr/local python waf configure --with-tensorflow",
   "python waf",
   "python waf install",
   # Monkey-patch package name.
@@ -63,8 +106,10 @@ before-all = [
   "sed 's/^name *= *\"essentia\"$/name = \"essentia-tensorflow\"/' pyproject.toml > pyproject.toml.patched && mv pyproject.toml.patched pyproject.toml"
 ]
 
-# FIXME Temporarily disable testing on macos-13 runner. The wheel is tagged as macosx_14_2 due to the Tensorflow dependency, so it can't be installed by pip ("not a supported wheel on this platform").
-#test-command = "python -c 'import essentia; import essentia.standard; import essentia.streaming; from essentia.standard import MonoLoader, MetadataReader, YamlInput, Chromaprinter, TensorflowPredict'"
+# Imports only. Real inference needs a 18 MB model from essentia.upf.edu, and
+# anything the build step depends on makes that host able to fail the build; the
+# workflow runs the inference check after the wheels exist instead.
+test-command = "python -c 'import essentia; import essentia.standard; import essentia.streaming; from essentia.standard import MonoLoader, MetadataReader, YamlInput, Chromaprinter, TensorflowPredict'"
 
 
 [[tool.cibuildwheel.overrides]]
@@ -73,25 +118,15 @@ select = "*macosx_arm64*"
 # See linux section for skip rationale.
 skip = ["*cp38*", "*t-*"]
 
-environment = { PROJECT_NAME="essentia-tensorflow", ESSENTIA_PROJECT_NAME="${PROJECT_NAME}", ESSENTIA_WHEEL_SKIP_3RDPARTY=1, ESSENTIA_WHEEL_ONLY_PYTHON=1, ESSENTIA_MACOSX_ARM64=1, MACOSX_DEPLOYMENT_TARGET=26.2 }
+environment = { PROJECT_NAME="essentia-tensorflow", ESSENTIA_PROJECT_NAME="${PROJECT_NAME}", ESSENTIA_WHEEL_SKIP_3RDPARTY=1, ESSENTIA_WHEEL_ONLY_PYTHON=1, ESSENTIA_MACOSX_ARM64=1, MACOSX_DEPLOYMENT_TARGET=15.0, PKG_CONFIG_PATH="$HOME/libtensorflow/lib/pkgconfig" }
 
 before-all = [
   "brew install pkg-config gcc readline sqlite gdbm libpng",
   "brew install eigen libyaml fftw ffmpeg libsamplerate libtag",
   "brew install chromaprint",
-  # Delocate checks for the min OS version (LC_BUILD_VERSION or C_VERSION_MIN_MACOSX).
-  # Tensorflow bottle has a minimum target of 26.2 which is too new.
-  # We could build from source as a workaround, however, it takes too much time on the CI worker.
-  # To keep it simple, just use the bottles available for tensorflow.
-  "brew install tensorflow",
-  # ---
-  # Building tensorflow from source:
-  #"echo Checking available SDKs:",
-  #"xcodebuild -showsdks",
-  #"SDKROOT=$(xcrun --sdk macosx14.0 --show-sdk-path) brew install --build-from-source tensorflow",
-  # ---
+  "bash packaging/fetch_libtensorflow.sh --prefix \"$HOME/libtensorflow\"",
   # Override VIRTUAL_ENV set by cibuildwheel to ensure global install
-  "VIRTUAL_ENV=/usr/local python waf configure --with-tensorflow --pkg-config-path=\"${PKG_CONFIG_PATH}\" --arch arm64 --no-msse",
+  "VIRTUAL_ENV=/usr/local python waf configure --with-tensorflow --arch arm64 --no-msse",
   "python waf",
   "sudo python waf install",
   # Monkey-patch package name.
