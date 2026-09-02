@@ -120,6 +120,45 @@ Re-run `./waf configure --with-tensorflow` afterwards, or drop --with-tensorflow
 build Essentia without the TensorflowPredict* algorithms.'''
 
 
+# Opt-in switch for wheel builds that link the TensorFlow C API straight out of a pip
+# `tensorflow` wheel rather than vendoring a copy of the library into the wheel. Read
+# from the environment as well as from --with-tensorflow-pip-rpath because a wheel build
+# runs `waf configure` twice -- once for libessentia and once, from setup.py, for the
+# bindings alone (--only-python) -- and only the environment reaches both invocations.
+# Accepted values: a directory (the pip tensorflow package to point the build-time rpath
+# at, which also turns the switch on), or a boolean-ish "1"/"true"/"yes"/"on".
+TENSORFLOW_PIP_RPATH_VAR = 'ESSENTIA_TENSORFLOW_PIP_RPATH'
+
+# Where a pip `tensorflow` package sits relative to the two binaries that carry a NEEDED
+# on its C API once they are installed from a wheel. `essentia/_essentia*.so` and the
+# vendored libessentia (auditwheel puts it in `essentia*.libs/`, delocate in
+# `essentia/.dylibs/`) both resolve TensorFlow through site-packages, and dyld/ld.so
+# search the loading binary's rpaths too, so one relative entry serves both.
+TENSORFLOW_PIP_RPATHS = {
+    'darwin': ['@loader_path/../tensorflow'],
+    'default': ['$ORIGIN/../tensorflow'],
+}
+
+# A last rpath entry, on ELF only, whose sole job is to not end in "tensorflow".
+#
+# ld packs .dynstr by letting a string share storage with any longer string it is a
+# suffix of. DT_RUNPATH is one colon-joined string, so an rpath ending in
+# ".../tensorflow" swallows the "tensorflow" symbol-version name that every TF_* symbol
+# reference in libessentia is tagged with. auditwheel then calls patchelf to rewrite the
+# rpath, and patchelf overwrites the whole old string with 'X' before writing the new,
+# shorter one -- which takes the version name with it. The wheel installs and then fails
+# at import with:
+#
+#   ImportError: libtensorflow_cc.so.2: version `XXXXXXXXXX' not found
+#                (required by .../essentia.libs/libessentia-<hash>.so)
+#
+# Ending the rpath with $ORIGIN keeps "tensorflow" a string of its own. $ORIGIN is a
+# sensible entry in its own right -- it is what auditwheel gives vendored libraries --
+# so this costs nothing beyond the explanation. Mach-O keeps each LC_RPATH in its own
+# string and install_name_tool rewrites them individually, so macOS needs no guard.
+TENSORFLOW_PIP_RPATH_GUARD = '$ORIGIN'
+
+
 def pkg_config_query(ctx, args):
     """Ask pkg-config a question and return its stripped stdout, or None if it fails.
 
@@ -224,6 +263,116 @@ def check_tensorflow(ctx, check_cfg_args):
             '', tensorflow_report(ctx), TENSORFLOW_HELP]))
 
 
+def tensorflow_pip_rpath_requested(ctx):
+    """Return the raw value of the pip-rpath switch, or '' when it is off.
+
+    The command-line flag only turns the switch on; a directory can only come from the
+    environment variable, which is the form a wheel build needs anyway.
+    """
+    if ctx.env.TENSORFLOW_PIP_RPATH:
+        return '1'
+    value = os.environ.get(TENSORFLOW_PIP_RPATH_VAR, '').strip()
+    if value.lower() in ('', '0', 'false', 'no', 'off'):
+        return ''
+    return value
+
+
+def tensorflow_package_dir(ctx, requested):
+    """Locate the pip tensorflow package directory the build links against.
+
+    Three sources, most explicit first: the directory named by the switch itself; the
+    `package_dir` variable that setup_tensorflow.py writes into the tensorflow.pc it
+    generates; and the tensorflow package importable by the interpreter running this
+    configure. Returns None when none of them resolves -- that is not fatal, since only
+    the absolute build-time rpath depends on it.
+    """
+    if requested.lower() not in ('1', 'true', 'yes', 'on'):
+        candidate = os.path.abspath(os.path.expanduser(requested))
+        if os.path.isdir(candidate):
+            return candidate
+        ctx.fatal('%s points at %s, which is not a directory.'
+                  % (TENSORFLOW_PIP_RPATH_VAR, requested))
+
+    from_pc = pkg_config_query(ctx, ['--variable=package_dir', lib_map['TENSORFLOW']])
+    if from_pc and os.path.isdir(from_pc):
+        return os.path.abspath(from_pc)
+
+    # find_spec locates the package without executing it. Importing TensorFlow costs
+    # seconds and drags in numpy; a configure needs neither, only the path.
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec('tensorflow')
+    except (ImportError, ValueError):
+        spec = None
+    for path in list(getattr(spec, 'submodule_search_locations', None) or []):
+        if os.path.isdir(path):
+            return os.path.abspath(path)
+    return None
+
+
+def configure_tensorflow_pip_rpath(ctx):
+    """Give libessentia and the Python extension a load-time path to a pip TensorFlow.
+
+    Wheels built this way ship no TensorFlow of their own: `auditwheel repair --exclude`
+    and `delocate-wheel --exclude` leave libtensorflow_cc / libtensorflow_framework out,
+    and these rpaths are what make the installed wheel find them next door in
+    site-packages, with no ctypes preload and no code in essentia/__init__.py.
+
+    Three things go in, all on ctx.env.LINKFLAGS so that every link task gets them --
+    both binaries carry a NEEDED on the C API, so an rpath on only one of them is not
+    enough, and LINKFLAGS is the one place both the libessentia build and the
+    --only-python bindings build read from:
+
+      - the relative rpath (@loader_path/../tensorflow, $ORIGIN/../tensorflow), which is
+        the entry that survives into the shipped wheel;
+      - an absolute rpath to the build-time package, needed only so that the repair tools
+        can *resolve* the excluded libraries -- exclusion happens after resolution, so
+        without it `delocate-wheel --exclude` dies with "Could not find all dependencies".
+        delocate's default --sanitize-rpaths then deletes it again, and auditwheel keeps
+        only $ORIGIN-relative rpaths, so it does not reach users;
+      - -Wl,-headerpad_max_install_names on macOS, so delocate has room to rewrite the
+        install names of the libraries it does vendor.
+
+    Off unless asked for: a plain source build links and runs exactly as it did before.
+    """
+    requested = tensorflow_pip_rpath_requested(ctx)
+    if not requested:
+        return
+
+    if not ctx.env.PKGCONFIG:
+        ctx.find_program('pkg-config', var='PKGCONFIG', mandatory=False)
+
+    flags = []
+    if sys.platform == 'darwin':
+        flags.append('-Wl,-headerpad_max_install_names')
+
+    rpaths = TENSORFLOW_PIP_RPATHS.get(sys.platform, TENSORFLOW_PIP_RPATHS['default'])
+
+    package_dir = tensorflow_package_dir(ctx, requested)
+    if package_dir:
+        rpaths = rpaths + [package_dir]
+    if sys.platform != 'darwin':
+        rpaths = rpaths + [TENSORFLOW_PIP_RPATH_GUARD]
+    if not package_dir:
+        # Not fatal: the shipped rpath is the relative one, and a build that is not going
+        # to be repaired into a wheel does not need the absolute entry at all.
+        print('- WARNING: could not locate a pip tensorflow package to point the '
+              'build-time rpath at.\n'
+              '  `delocate-wheel --exclude` / `auditwheel repair --exclude` will then be '
+              'unable to resolve\n'
+              '  libtensorflow_cc unless it is reachable some other way. Set %s to the\n'
+              '  site-packages/tensorflow directory to fix this.' % TENSORFLOW_PIP_RPATH_VAR)
+
+    flags += ['-Wl,-rpath,%s' % rpath for rpath in rpaths]
+
+    # Keep the switch idempotent: `waf configure` may be re-run over an existing env.
+    ctx.env.LINKFLAGS += [flag for flag in flags if flag not in ctx.env.LINKFLAGS]
+
+    print('- linking against a pip TensorFlow wheel (%s)' % TENSORFLOW_PIP_RPATH_VAR)
+    print('    tensorflow package:  %s' % (package_dir or '(not found)'))
+    print('    added LINKFLAGS:     %s' % ' '.join(flags))
+
+
 def options(ctx):
     ctx.add_option('--with-python', action='store_true',
                    dest='WITH_PYTHON', default=False,
@@ -255,6 +404,15 @@ def options(ctx):
     ctx.add_option('--with-tensorflow', action='store_true',
                    dest='WITH_TENSORFLOW', default=False,
                    help='build with Tensorflow support')
+    ctx.add_option('--with-tensorflow-pip-rpath', action='store_true',
+                   dest='TENSORFLOW_PIP_RPATH', default=False,
+                   help='link for a wheel that finds TensorFlow in a pip `tensorflow` '
+                        'install rather than vendoring it: adds an rpath to '
+                        'site-packages/tensorflow to libessentia and to the python '
+                        'extension, plus -headerpad_max_install_names on macOS. '
+                        'Equivalent to setting %s=1; set that variable to a directory '
+                        'instead to name the pip tensorflow package explicitly.'
+                        % TENSORFLOW_PIP_RPATH_VAR)
     ctx.add_option('--lightweight', action='store',
                    dest='LIGHTWEIGHT', default=False,
                    help='build lightweight version with specified dependencies (comma separated: =' + ','.join(default_libs) + ')')
@@ -334,6 +492,10 @@ def configure(ctx):
     check_cfg_args = ['--cflags', '--libs']
     #if ctx.env.STATIC_DEPENDENCIES:
     #    check_cfg_args += ['--static']
+
+    # Before the --only-python early return below: a wheel build configures twice, and
+    # both the libessentia link and the bindings link need these rpaths.
+    configure_tensorflow_pip_rpath(ctx)
 
     if ctx.env.ONLY_PYTHON:
        print("→ Building only Essentia's python bindings (libessentia should be pre-installed)")
@@ -447,6 +609,14 @@ def configure(ctx):
 
     if 'tensorflow' in ctx.env.CHECK_LIBS:
         check_tensorflow(ctx, check_cfg_args)
+        # A tensorflow.pc generated by setup_tensorflow.py carries its own -Wl,-rpath to
+        # the pip package, which check_cfg stores as RPATH_TENSORFLOW. With the pip-rpath
+        # switch on, that same path is already in the global LINKFLAGS and ld warns about
+        # the duplicate on every link; keep the global entry, which also reaches targets
+        # that do not use the TENSORFLOW uselib.
+        ctx.env['RPATH_TENSORFLOW'] = [
+            path for path in ctx.env['RPATH_TENSORFLOW']
+            if ('-Wl,-rpath,%s' % path) not in ctx.env.LINKFLAGS]
 
     # needed by ffmpeg for the INT64_C macros
     ctx.env.DEFINES += ['__STDC_CONSTANT_MACROS']
