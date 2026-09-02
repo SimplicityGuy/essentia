@@ -23,6 +23,66 @@ lib_map = {
     'GAIA2': 'gaia2',
     'TENSORFLOW': 'tensorflow'}
 
+# FFmpeg / libav version floor.
+#
+# src/essentia/utils/audiocontext.cpp and src/algorithms/io/audioloader.cpp use
+# AVChannelLayout / AVCodecContext.ch_layout unconditionally, an API FFmpeg introduced in
+# its 5.1 release (libavcodec 59.37). Any older FFmpeg/LibAv passes the pre-5.1 pkg-config
+# check that used to live here (libavcodec >= 55.34.1, set in 2015 for LibAv 10) but then
+# fails to compile on `ch_layout`, or -- worse -- silently resolves against the wrong one
+# of two installed FFmpeg versions. Keep every component's floor in this single dict so a
+# future bump only touches these lines; keep it in sync with doc/sphinxdoc/installing.rst.
+FFMPEG_MIN_RELEASE = 'FFmpeg >= 5.1 (or an equivalent LibAv release)'
+FFMPEG_MIN_VERSIONS = {
+    'AVCODEC': '59.37',      # AVCodecContext.ch_layout / AVChannelLayout
+    'AVFORMAT': '59.27',
+    'AVUTIL': '57.28',
+    'SWRESAMPLE': '4.7',
+}
+
+
+def _pkgconfig_query(ctx, pkg, arg):
+    """Run `pkg-config <arg> <pkg>` and return its stripped stdout, or None on failure
+    (package not found, or the pkg-config in use does not support <arg>)."""
+    # ctx.env.PKGCONFIG is stored waf-style, as a one-element list (like ctx.env.CC).
+    pkgconfig = ctx.env.PKGCONFIG
+    if not isinstance(pkgconfig, list):
+        pkgconfig = [pkgconfig]
+    try:
+        return ctx.cmd_and_log(pkgconfig + [arg, pkg], env=ctx.env.env or None).strip()
+    except ctx.errors.WafError:
+        return None
+
+
+def _ffmpeg_version_atleast(found, minimum):
+    """Compare dotted version strings numerically (not lexicographically), tolerating
+    trailing non-numeric suffixes in a version component."""
+    def to_tuple(v):
+        parts = []
+        for chunk in v.split('.'):
+            digits = ''
+            for c in chunk:
+                if c.isdigit():
+                    digits += c
+                else:
+                    break
+            parts.append(int(digits) if digits else 0)
+        return tuple(parts)
+    return to_tuple(found) >= to_tuple(minimum)
+
+
+def _ffmpeg_floor_message(pkg, found_version, pc_path, minimum, reason=None):
+    return (
+        "essentia requires {release}: '{pkg}' {found} (via {pcpath}) {reason}, "
+        "need >= {minimum}.\n"
+        "  -> Install a newer FFmpeg (or LibAv) and/or point PKG_CONFIG_PATH at its "
+        "pkg-config directory (see doc/sphinxdoc/installing.rst).".format(
+            release=FFMPEG_MIN_RELEASE, pkg=pkg,
+            found=found_version if found_version else 'not found',
+            pcpath=pc_path or 'unknown .pc path',
+            reason=reason or 'is older than required',
+            minimum=minimum))
+
 
 def options(ctx):
     ctx.add_option('--with-python', action='store_true',
@@ -151,19 +211,67 @@ def configure(ctx):
     ctx.env.DEFINES += ['EIGEN_PERMANENTLY_DISABLE_STUPID_WARNINGS']
 
     if 'libav' in ctx.env.CHECK_LIBS:
-        ctx.check_cfg(package=lib_map['AVCODEC'], uselib_store='AVCODEC',
-                      args=['{} >= 55.34.1'.format(lib_map['AVCODEC'])] + check_cfg_args,
-                      msg="Checking for '{}' >= 55.34.1".format(lib_map['AVCODEC']),
-                      mandatory=False)
+        if not ctx.env.PKGCONFIG:
+            ctx.find_program('pkg-config', var='PKGCONFIG')
 
-        ctx.check_cfg(package=lib_map['AVFORMAT'], uselib_store='AVFORMAT',
-                      args=check_cfg_args, mandatory=False)
+        ffmpeg_versions_found = {}
 
-        ctx.check_cfg(package=lib_map['AVUTIL'], uselib_store='AVUTIL',
-                      args=check_cfg_args, mandatory=False)
+        for lib_key in ('AVCODEC', 'AVFORMAT', 'AVUTIL', 'SWRESAMPLE'):
+            pkg = lib_map[lib_key]
+            min_version = FFMPEG_MIN_VERSIONS[lib_key]
 
-        ctx.check_cfg(package=lib_map['SWRESAMPLE'], uselib_store='SWRESAMPLE',
-                      args=check_cfg_args, mandatory=False)
+            # Query the installed version directly (independent of the check_cfg version
+            # constraint below) so a too-old package can be reported with a precise
+            # diagnostic instead of the generic "not found" that a failed check_cfg gives.
+            found_version = _pkgconfig_query(ctx, pkg, '--modversion')
+            pc_path = _pkgconfig_query(ctx, pkg, '--path')
+            ffmpeg_versions_found[lib_key] = (found_version, pc_path)
+
+            if found_version is not None and not _ffmpeg_version_atleast(found_version, min_version):
+                ctx.fatal(_ffmpeg_floor_message(pkg, found_version, pc_path, min_version))
+
+            ctx.check_cfg(package=pkg, uselib_store=lib_key,
+                          args=['{} >= {}'.format(pkg, min_version)] + check_cfg_args,
+                          msg="Checking for '{}' >= {}".format(pkg, min_version),
+                          mandatory=False)
+
+        def _ffmpeg_have(*keys):
+            return all(('HAVE_%s' % k) in ctx.env['define_key'] for k in keys)
+
+        # Guard against a distro backporting the AVChannelLayout API onto an
+        # older-looking .pc version string (or vice versa): compile the exact API surface
+        # essentia's FFmpeg glue relies on, rather than trusting the version string alone.
+        if _ffmpeg_have('AVCODEC', 'AVUTIL'):
+            have_ch_layout = ctx.check_cxx(
+                fragment='''
+                    extern "C" {
+                    #include <libavcodec/avcodec.h>
+                    }
+                    int main() {
+                        AVCodecContext codec_ctx;
+                        av_channel_layout_default(&codec_ctx.ch_layout, 2);
+                        return 0;
+                    }
+                ''',
+                use=['AVCODEC', 'AVUTIL'],
+                msg='Checking for AVChannelLayout / AVCodecContext.ch_layout',
+                mandatory=False)
+
+            if not have_ch_layout:
+                found_version, pc_path = ffmpeg_versions_found['AVCODEC']
+                ctx.fatal(_ffmpeg_floor_message(
+                    lib_map['AVCODEC'], found_version, pc_path, FFMPEG_MIN_VERSIONS['AVCODEC'],
+                    reason='reports a satisfying version but does not provide '
+                           'AVChannelLayout / AVCodecContext.ch_layout'))
+
+        # Print the selected FFmpeg / libav component versions and .pc paths so that, with
+        # two installs on PKG_CONFIG_PATH, the one actually picked up is visible here.
+        if _ffmpeg_have('AVCODEC', 'AVFORMAT', 'AVUTIL', 'SWRESAMPLE'):
+            print('- FFmpeg / libav components selected (required: {}):'.format(FFMPEG_MIN_RELEASE))
+            for lib_key in ('AVCODEC', 'AVFORMAT', 'AVUTIL', 'SWRESAMPLE'):
+                found_version, pc_path = ffmpeg_versions_found[lib_key]
+                print('    {} {}  ({})'.format(lib_map[lib_key], found_version,
+                                                pc_path or 'unknown .pc path'))
 
     if 'libsamplerate' in ctx.env.CHECK_LIBS:
         ctx.check_cfg(package=lib_map['SAMPLERATE'], uselib_store='SAMPLERATE',
