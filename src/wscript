@@ -84,6 +84,146 @@ def _ffmpeg_floor_message(pkg, found_version, pc_path, minimum, reason=None):
             minimum=minimum))
 
 
+# Oldest TensorFlow we support. The 1.x C API was exported by the Python wrapper
+# extension; from 2.x it lives in a standalone shared library, which is the layout
+# every TensorflowPredict* algorithm is developed and tested against.
+TENSORFLOW_MIN_VERSION = '2.0'
+
+# Header Essentia's TensorflowPredict* algorithms include, relative to an include dir.
+TENSORFLOW_HEADER = os.path.join('tensorflow', 'c', 'c_api.h')
+
+# TF_Version proves we found *a* TensorFlow library. TF_DeleteSession proves it exports
+# the full C API rather than one of the Python wrapper shims: linking against
+# _pywrap_tensorflow_internal or libtensorflow_framework alone satisfies
+# `pkg-config --exists tensorflow` but leaves TF_DeleteSession undefined, so the build
+# used to succeed and fail only when the extension was imported (MTG#1350, MTG#1308).
+TENSORFLOW_FRAGMENT = '''
+#include <tensorflow/c/c_api.h>
+
+int main() {
+    TF_Status* status = TF_NewStatus();
+    TF_DeleteSession((TF_Session*)0, status);
+    TF_DeleteStatus(status);
+    return TF_Version() == 0;
+}
+'''
+
+TENSORFLOW_HELP = '''
+Essentia links against the TensorFlow C API. Provide it in one of these ways:
+  - install a TensorFlow C library that ships a tensorflow.pc, for example
+    `brew install libtensorflow` or a distribution package;
+  - generate a tensorflow.pc from a pip TensorFlow >= 2.13 wheel:
+        python3 src/3rdparty/tensorflow/setup_tensorflow.py --prefix <dir>
+    then add <dir>/lib/pkgconfig to PKG_CONFIG_PATH;
+  - point PKG_CONFIG_PATH at a directory holding your own tensorflow.pc.
+Re-run `./waf configure --with-tensorflow` afterwards, or drop --with-tensorflow to
+build Essentia without the TensorflowPredict* algorithms.'''
+
+
+def pkg_config_query(ctx, args):
+    """Ask pkg-config a question and return its stripped stdout, or None if it fails.
+
+    Only used to build diagnostics, so a failing query is reported as unknown rather
+    than raised.
+    """
+    from subprocess import CalledProcessError, STDOUT, check_output
+
+    cmd = list(ctx.env.PKGCONFIG or ['pkg-config']) + args
+    try:
+        out = check_output(cmd, env=ctx.env.env, stderr=STDOUT)
+    except (OSError, CalledProcessError):
+        return None
+    return out.decode('utf-8', 'replace').strip()
+
+
+def tensorflow_report(ctx):
+    """Summarise what pkg-config told us about TensorFlow, to attach to configure errors."""
+    package = lib_map['TENSORFLOW']
+
+    def joined(key):
+        return ', '.join(ctx.env[key]) or '(none)'
+
+    return '\n'.join([
+        '  PKG_CONFIG_PATH:  %s' % (ctx.env.env.get('PKG_CONFIG_PATH')
+                                    or '(unset; pkg-config default paths)'),
+        '  %s.pc found in: %s' % (package,
+                                  pkg_config_query(ctx, ['--variable=pcfiledir', package])
+                                  or '(not found)'),
+        '  Version:          %s' % (pkg_config_query(ctx, ['--modversion', package])
+                                    or '(unknown)'),
+        '  Cflags:           %s' % (pkg_config_query(ctx, ['--cflags', package]) or '(none)'),
+        '  Libs:             %s' % (pkg_config_query(ctx, ['--libs', package]) or '(none)'),
+        '  Include dirs:     %s' % joined('INCLUDES_TENSORFLOW'),
+        '  Library dirs:     %s' % joined('LIBPATH_TENSORFLOW'),
+        '  Libraries tried:  %s' % joined('LIB_TENSORFLOW'),
+    ])
+
+
+def check_tensorflow(ctx, check_cfg_args):
+    """Find TensorFlow and prove its C API is usable before building against it.
+
+    `pkg-config --exists tensorflow` is not enough on its own: it is satisfied by any
+    tensorflow.pc, including ones naming a library that does not export the C API. Such a
+    .pc used to configure and build cleanly and then fail at `import essentia.standard`
+    with `undefined symbol: TF_DeleteSession`. Fail here instead, and say what to fix.
+    """
+    package = lib_map['TENSORFLOW']
+    if not ctx.env.PKGCONFIG:
+        ctx.find_program('pkg-config', var='PKGCONFIG')
+
+    # 1. Locate tensorflow.pc and enforce the 2.x floor from its Version field.
+    try:
+        ctx.check_cfg(package=package, uselib_store='TENSORFLOW',
+                      args=['%s >= %s' % (package, TENSORFLOW_MIN_VERSION)] + check_cfg_args,
+                      msg="Checking for '%s' >= %s" % (package, TENSORFLOW_MIN_VERSION),
+                      mandatory=True)
+    except ctx.errors.ConfigurationError:
+        found = pkg_config_query(ctx, ['--modversion', package])
+        if found:
+            reason = ('TensorFlow %s is too old: Essentia needs >= %s.'
+                      % (found, TENSORFLOW_MIN_VERSION))
+        else:
+            reason = 'No %s.pc was found.' % package
+        raise ctx.errors.ConfigurationError(
+            '\n'.join([reason, '', tensorflow_report(ctx), TENSORFLOW_HELP]))
+
+    # 2. Normalise the include path. Essentia includes <tensorflow/c/c_api.h>, but some
+    #    installations set includedir to the tensorflow/ directory itself rather than to
+    #    its parent — Homebrew's libtensorflow.pc uses <prefix>/include/tensorflow — so the
+    #    header only resolves from the parent. Add it when that is what makes it resolve.
+    includes = list(ctx.env['INCLUDES_TENSORFLOW'])
+    for path in list(includes):
+        if os.path.exists(os.path.join(path, TENSORFLOW_HEADER)):
+            continue
+        parent = os.path.dirname(os.path.normpath(path))
+        if parent and os.path.exists(os.path.join(parent, TENSORFLOW_HEADER)):
+            includes.append(parent)
+    ctx.env['INCLUDES_TENSORFLOW'] = includes
+
+    # 3. Compile against those headers, then link against those libraries. Splitting the
+    #    two tells the user which half is wrong instead of just "the check failed".
+    if not ctx.check_cxx(fragment=TENSORFLOW_FRAGMENT, use='TENSORFLOW', features='cxx',
+                         msg='Checking for the TensorFlow C API headers',
+                         errmsg='not found', mandatory=False):
+        raise ctx.errors.ConfigurationError('\n'.join([
+            '<%s> does not resolve with the include flags from %s.pc.'
+            % (TENSORFLOW_HEADER.replace(os.sep, '/'), package),
+            '', tensorflow_report(ctx), TENSORFLOW_HELP]))
+
+    if not ctx.check_cxx(fragment=TENSORFLOW_FRAGMENT, use='TENSORFLOW', execute=False,
+                         msg='Checking that the TensorFlow C API links',
+                         errmsg='unresolved', mandatory=False):
+        raise ctx.errors.ConfigurationError('\n'.join([
+            'The TensorFlow C API headers were found, but TF_Version and TF_DeleteSession '
+            'did not resolve against the libraries named by %s.pc.' % package,
+            '',
+            'That .pc most likely names something other than the TensorFlow C library. The '
+            'Python wrapper shim (_pywrap_tensorflow_internal) and libtensorflow_framework '
+            'do not export the C API on their own. Since TensorFlow 2.13 it is exported by '
+            'libtensorflow_cc (pip wheels) or by libtensorflow (the standalone C library).',
+            '', tensorflow_report(ctx), TENSORFLOW_HELP]))
+
+
 def options(ctx):
     ctx.add_option('--with-python', action='store_true',
                    dest='WITH_PYTHON', default=False,
@@ -306,8 +446,7 @@ def configure(ctx):
                       args=check_cfg_args, mandatory=True)
 
     if 'tensorflow' in ctx.env.CHECK_LIBS:
-        ctx.check_cfg(package=lib_map['TENSORFLOW'], uselib_store='TENSORFLOW',
-                      args=check_cfg_args, mandatory=True)
+        check_tensorflow(ctx, check_cfg_args)
 
     # needed by ffmpeg for the INT64_C macros
     ctx.env.DEFINES += ['__STDC_CONSTANT_MACROS']
