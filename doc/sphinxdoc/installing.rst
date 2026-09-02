@@ -106,11 +106,7 @@ version from source <FAQ.html#build-essentia-on-ubuntu-14-04-or-earlier>`_, or b
 under a separate prefix and point ``PKG_CONFIG_PATH`` (or ``./waf configure
 --pkg-config-path``) at its ``pkgconfig`` directory.
 
-If you are willing to use Essentia with a TensorFlow wrapper in C++, install the TensorFlow shared library using a helper script inside our source code::
-
-  src/3rdparty/tensorflow/setup_from_libtensorflow.sh
-
-
+If you want to use Essentia with a TensorFlow wrapper in C++, see `Installing TensorFlow`_ below.
 
 
 Installing dependencies on macOS
@@ -139,6 +135,43 @@ Install Essentia's dependencies::
   brew install python --framework
   pip install ipython numpy matplotlib pyyaml
 
+
+Installing TensorFlow
+---------------------
+
+The ``TensorflowPredict*`` algorithms link against the TensorFlow C API. Essentia finds
+it with pkg-config, so whatever you install has to provide a ``tensorflow.pc``, and
+``configure --with-tensorflow`` fails if it cannot link ``TF_Version`` and
+``TF_DeleteSession`` against the libraries that ``tensorflow.pc`` names. TensorFlow 2.0
+is the minimum; the ``TensorflowPredict*`` algorithms are developed against 2.x.
+
+The simplest option is a packaged TensorFlow C library, which already ships a
+``tensorflow.pc``. On macOS::
+
+  brew install libtensorflow
+
+If your platform has no such package, generate a ``tensorflow.pc`` from a pip
+``tensorflow`` wheel (2.13 or newer). The wheel carries the C API in
+``libtensorflow_cc`` alongside a matching header tree, and the helper script points
+pkg-config at them in place rather than copying the library::
+
+  pip3 install "tensorflow>=2.13"
+  python3 src/3rdparty/tensorflow/setup_tensorflow.py --prefix ~/.local
+  export PKG_CONFIG_PATH=~/.local/lib/pkgconfig:$PKG_CONFIG_PATH
+
+Linking against the wheel's libraries is also what lets a process import both
+``essentia`` and ``tensorflow`` without the two loading separate copies of TensorFlow.
+
+The helper writes symlinks with linker-friendly names into ``<prefix>/lib`` and the
+``tensorflow.pc`` itself into ``<prefix>/lib/pkgconfig``. Pick a prefix you own; the
+default of ``/usr/local`` needs ``sudo`` on most systems. Run
+``setup_tensorflow.py --help`` for the remaining options, including ``--package-dir``
+to point at an unpacked wheel instead of an importable package.
+
+You can also write your own ``tensorflow.pc`` and put its directory on
+``PKG_CONFIG_PATH``. Its ``Cflags`` must make ``<tensorflow/c/c_api.h>`` resolve, and
+its ``Libs`` must name a library that exports the C API. ``libtensorflow_framework``
+and the Python wrapper extension ``_pywrap_tensorflow_internal`` do not, on their own.
 
 
 Compiling Essentia
