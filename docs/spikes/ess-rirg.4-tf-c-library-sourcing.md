@@ -75,22 +75,46 @@ symbols are version-tagged (`TF_NewSession@@tensorflow`), which is why a naive
 | --- | --- | --- | --- |
 | `tensorflow==2.17.0` pip wheel (`libtensorflow_cc.so.2` + `libtensorflow_framework.so.2`) | linux aarch64 | **29/29** | SONAMEs `libtensorflow_cc.so.2`, `libtensorflow_framework.so.2`; max GLIBC 2.17; max GLIBCXX 3.4.19; ships `include/tensorflow/c/c_api.h` |
 | `tensorflow==2.17.0` pip wheel (`libtensorflow_cc.2.dylib` + framework) | macOS arm64 | **29/29** | **minos 12.0**, sdk 13.3, `install_name @rpath/…` |
-| `libtensorflow-cpu-darwin-arm64.tar.gz` 2.17.0 (storage.googleapis.com/tensorflow) | macOS arm64 | **29/29** | **minos 12.0**; 439 MB + 38 MB; links only system frameworks |
+| `libtensorflow-cpu-darwin-arm64.tar.gz` 2.17.0 (`storage.googleapis.com/tensorflow/versions/2.17.0/`) | macOS arm64 | **29/29** | **minos 12.0**; 439 MB + 38 MB; links only system frameworks. Note the `versions/<v>/` path — see §1a |
 | conda-forge `libtensorflow` 2.19.1 | linux aarch64 | **29/29** | SONAME `libtensorflow.so.2`; max GLIBC 2.17 but GLIBCXX 3.4.30 / CXXABI 1.3.13, and NEEDED `libabsl_*.so.2505.0.0`, `libprotobuf.so.31.1.0` |
 | Homebrew `libtensorflow` 2.21.0 `arm64_linux` bottle | linux aarch64 | **29/29** | SONAME `libtensorflow.so.2`; NEEDED only glibc/libstdc++/libgcc; max GLIBC **2.27**, GLIBCXX 3.4.22 |
 
-Availability of the official Google-published C-library tarballs (HTTP status):
+The finding that the pip wheel is now where the C API lives is corroborated independently by
+the **ess-rirg.2 seat**, which measured the same layout on TensorFlow 2.17.1: the C API in
+`tensorflow/libtensorflow_cc.2.dylib` (577 MB, macOS arm64) and
+`tensorflow/libtensorflow_cc.so.2` (1037 MB, manylinux x86_64), a complete
+`tensorflow/include/tensorflow/c` header tree, no `tensorflow_core` directory, and
+`_pywrap_tensorflow_internal.so` reduced to a 2.4 MB pybind shim. That last point is why the
+project's old helper link line resolves nothing.
 
-| version | `libtensorflow-cpu-darwin-arm64` | `libtensorflow-cpu-linux-x86_64` | `…-linux-arm64` / `…-linux-aarch64` |
-| --- | --- | --- | --- |
-| 2.16.1 | 200 | — | 404 |
-| 2.17.0 | **200** | 200 | 404 |
-| 2.18.0 | **200** | 200 | 404 |
-| 2.19.0 | 404 | 404 | 404 |
-| 2.20.0 | 404 | 404 | 404 |
+### 1a. Availability of the official C-library tarballs — the channel moved, then stopped
 
-TensorFlow stopped publishing the standalone C library after **2.18.0**, on every platform.
-There has never been an official linux aarch64 build.
+This one needs care, because a naive probe gives the wrong answer, and the ess-rirg.2 seat
+and this one initially disagreed about it. **There are two URL schemes**, and the old one was
+retired at 2.16. Ranged `GET` (not `HEAD`) against both:
+
+| version | old `…/libtensorflow/libtensorflow-cpu-<plat>-<v>.tar.gz` — darwin-arm64 | — linux-x86_64 | new `…/versions/<v>/libtensorflow-cpu-<plat>.tar.gz` — darwin-arm64 | — linux-x86_64 |
+| --- | --- | --- | --- | --- |
+| 2.11.0 | 404 | **206** | 404 | 404 |
+| 2.15.0 | 404 | **206** | 404 | 404 |
+| 2.16.2 | 404 | 404 | **206** | **206** |
+| 2.17.0 | 404 | 404 | **206** | **206** |
+| 2.18.0 | 404 | 404 | **206** | **206** |
+| 2.19.0 | 404 | 404 | 404 | 404 |
+
+So the correct statement is **not** that the channel died at 2.15.0 and that darwin-arm64
+never existed — that is exactly what the old path alone shows, and it is what a probe of that
+path reported from the ess-rirg.2 seat. TensorFlow **moved** the tarballs to `versions/<v>/`
+at 2.16 and **added** a darwin-arm64 build in the new layout. The channel then genuinely
+stops after **2.18.0**, on every platform.
+
+This is not inferred from status codes. The 2.17.0 darwin-arm64 tarball was downloaded in
+full (104 MB), unpacked, and its `lib/libtensorflow.2.17.0.dylib` inspected directly:
+`LC_BUILD_VERSION minos 12.0`, `install_name @rpath/libtensorflow.2.dylib`, 29/29 C-API
+symbols, no non-system dependencies. It exists and it is usable. Anyone re-checking this must
+use the `versions/<v>/` form.
+
+There has never been an official linux aarch64 build under either scheme.
 
 ### 2. The macOS floor is a Homebrew `libtensorflow` bug, not a fact about TensorFlow
 
@@ -318,7 +342,9 @@ Two usable sources, both with 29/29 symbol coverage:
   `build_tensorflow.sh` produces, so `generate-pc.sh` and the existing `tensorflow.pc`
   handling apply unchanged. This is the cleanest drop-in replacement for the Homebrew bottle.
   **Caveat: the channel is frozen at 2.18.0** — nothing is published for 2.19+ — so it caps
-  the TensorFlow version the wheels can offer.
+  the TensorFlow version the wheels can offer. **Use the `versions/<v>/` URL form**; the older
+  `libtensorflow/libtensorflow-cpu-<plat>-<v>.tar.gz` path was retired at 2.16 and probing it
+  makes this source look non-existent (§1a).
 - **linux/aarch64: the Homebrew `libtensorflow` 2.21.0 `arm64_linux` bottle.** Monolithic
   `libtensorflow.so.2` (448 MB), SONAME `libtensorflow.so.2`, NEEDED nothing but
   glibc/libstdc++/libgcc, max GLIBC 2.27. That rules out `manylinux2014` but satisfies
