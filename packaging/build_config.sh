@@ -16,7 +16,13 @@ FFMPEG_VERSION=ffmpeg-7.1.1
 LAME_VERSION=3.100
 TAGLIB_VERSION=taglib-1.11.1
 ZLIB_VERSION=zlib-1.2.12
-FFTW_VERSION=fftw-3.3.2
+# FFTW 3.3.2 (2012) predates AArch64: its bundled config.sub does not know the
+# aarch64-*-linux-gnu triplet and it has no NEON codelets for 64-bit ARM. Use
+# 3.3.10 there. x86_64 and win32 keep 3.3.2 so their wheels are unchanged.
+case "$(uname -m)" in
+  aarch64|arm64) FFTW_VERSION=fftw-3.3.10 ;;
+  *)             FFTW_VERSION=fftw-3.3.2 ;;
+esac
 LIBSAMPLERATE_VERSION=libsamplerate-0.1.9
 LIBYAML_VERSION=yaml-0.1.5
 CHROMAPRINT_VERSION=1.5.1
@@ -203,12 +209,51 @@ FFMPEG_AUDIO_FLAGS_MUXERS="
 "
 
 # see http://www.fftw.org/install/windows.html
-FFTW_FLAGS="
+# --enable-sse2, --with-incoming-stack-boundary and --with-our-malloc16 are
+# x86-only and are rejected by configure on AArch64, where NEON is mandatory
+# and malloc is already 16-byte aligned.
+case "$(uname -m)" in
+  aarch64|arm64)
+    FFTW_FLAGS="
+    --enable-float
+    --enable-neon
+"
+    ;;
+  *)
+    FFTW_FLAGS="
     --enable-float
     --enable-sse2
     --with-incoming-stack-boundary=2
     --with-our-malloc16
 "
+    ;;
+esac
+
+# Several of the pinned source tarballs ship an autotools config.guess/config.sub
+# that predates AArch64 -- libsamplerate 0.1.9 carries a 2009 copy, libyaml 0.1.5
+# a 2010 one -- so their configure aborts with "unable to guess system type" on
+# arm64. Refresh those two files in the unpacked tree from the build machine's
+# own automake. Deliberately a no-op off arm64, so x86_64 and win32 builds keep
+# using exactly the scripts their tarballs ship.
+refresh_autotools_config() {
+    case "$(uname -m)" in
+        aarch64|arm64) ;;
+        *) return 0 ;;
+    esac
+
+    for name in config.guess config.sub; do
+        newest=$(ls /usr/local/share/automake-*/$name /usr/share/automake-*/$name 2>/dev/null | tail -1)
+        if [ -z "$newest" ]; then
+            echo "warning: no replacement $name found; leaving ${1:-.} alone" >&2
+            continue
+        fi
+        for target in $(find "${1:-.}" -name "$name" -type f); do
+            echo "Refreshing $target from $newest"
+            cp "$newest" "$target"
+            chmod +x "$target"
+        done
+    done
+}
 
 LIBSAMPLERATE_FLAGS="
     --disable-fftw
