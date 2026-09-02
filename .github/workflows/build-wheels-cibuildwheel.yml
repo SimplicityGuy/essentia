@@ -207,3 +207,101 @@ jobs:
             --workdir /w \
             arm64v8/python:3.12-slim \
             bash -euxo pipefail -c 'pip install --no-cache-dir wheelhouse/essentia-*-cp312-cp312-manylinux*_aarch64.whl && python packaging/verify_wheel_audio.py test/audio/recorded/*.mp3'
+
+  # =====================================================================================
+  # test_wheels: run the Python unit test suite (test/src/unittests) against an
+  # INSTALLED cp312 wheel, per platform, rather than an in-tree build -- this proves
+  # what a `pip install essentia` user actually gets. See ess-rirg.6.
+  #
+  # Tests that cannot pass here (TensorflowPredict* and its wrapper algorithms, absent
+  # from the base non-tensorflow wheel; Gaia2, only ever linked into the x86_64 Linux
+  # base wheel) are excluded through test/src/unittests/ci_skiplist.txt, one documented
+  # reason per entry. io/AudioLoader, streaming and FrameCutter run unskipped everywhere.
+  #
+  # Where an essentia-tensorflow wheel exists for the platform (x86_64 Linux, macOS
+  # arm64), a separate step installs THAT wheel into an isolated venv and smoke-tests
+  # TensorflowPredictEffnetDiscogs end-to-end against a downloaded model.
+  # =====================================================================================
+  test_wheels:
+    name: Test wheel / ${{ matrix.os }}
+    needs: [build_wheels, build_wheels_linux_aarch64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            artifact: artifact-ubuntu-24.04-cibuildwheel
+            tf_artifact: artifact-ubuntu-24.04-cibuildwheel-tensorflow
+          - os: ubuntu-24.04-arm
+            artifact: artifact-ubuntu-24.04-arm-cibuildwheel
+            tf_artifact: ''
+          - os: macos-15
+            artifact: artifact-macos-15-cibuildwheel
+            tf_artifact: artifact-macos-15-cibuildwheel-tensorflow
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch the test audio fixtures submodule
+        run: git submodule update --init test/audio
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@v6
+        with:
+          name: ${{ matrix.artifact }}
+          path: wheelhouse
+
+      - name: Install the cp312 wheel and test-only dependencies
+        # numpy/pyyaml/six ride in as the wheel's own install_requires.
+        # scikit-learn is test-only (test/src/unittests/standard/test_tensornormalize.py).
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install wheelhouse/essentia-*-cp312-*.whl scikit-learn
+
+      - name: Run the Python unit test suite
+        run: |
+          skip_args=$(awk 'NF && $1 !~ /^#/ {print "-"$1}' test/src/unittests/ci_skiplist.txt)
+          echo "Skipping (see test/src/unittests/ci_skiplist.txt): $skip_args"
+          python3 test/src/unittests/all_tests.py $skip_args
+
+      - name: Download the essentia-tensorflow wheel
+        if: matrix.tf_artifact != ''
+        uses: actions/download-artifact@v6
+        with:
+          name: ${{ matrix.tf_artifact }}
+          path: wheelhouse-tensorflow
+
+      - name: TensorFlow smoke test (TensorflowPredictEffnetDiscogs)
+        if: matrix.tf_artifact != ''
+        # Isolated venv: essentia-tensorflow conflicts with the plain essentia wheel
+        # installed above (same import name, different shared objects).
+        run: |
+          python3 -m venv /tmp/tf-venv
+          source /tmp/tf-venv/bin/activate
+          python3 -m pip install --upgrade pip
+
+          if ! pip install wheelhouse-tensorflow/essentia_tensorflow-*-cp312-*.whl; then
+            echo "SKIP: the essentia-tensorflow wheel refused to install on this runner" \
+                 "(expected on macos-15 for the arm64 build, which is tagged for a newer" \
+                 "macOS than this runner ships). Skipping the TensorFlow smoke test."
+            exit 0
+          fi
+
+          curl -fsSL -o /tmp/discogs-effnet-bs64-1.pb \
+            https://essentia.upf.edu/models/music-style-classification/discogs-effnet/discogs-effnet-bs64-1.pb
+
+          python3 - <<'PY'
+          import essentia.standard as es
+
+          audio = es.MonoLoader(filename='test/audio/recorded/techno_loop.wav', sampleRate=16000)()
+          assert len(audio) > 0, 'MonoLoader decoded 0 samples'
+
+          activations = es.TensorflowPredictEffnetDiscogs(graphFilename='/tmp/discogs-effnet-bs64-1.pb')(audio)
+          assert len(activations) > 0, 'TensorflowPredictEffnetDiscogs produced no output'
+          print(f'OK: {len(activations)} activation frames from techno_loop.wav')
+          PY
