@@ -24,6 +24,24 @@ You can install Essentia Python extension from PyPi::
 For other needs, you need to compile Essentia from source (see below).
 
 
+Installing from the sdist
+--------------------------
+If no prebuilt wheel is available for your platform or Python version, pip falls back to
+Essentia's source distribution (sdist) and builds it locally. This requires the same system
+libraries as compiling from source (see `Installing dependencies on Linux`_ below)::
+
+  sudo apt-get install build-essential libeigen3-dev libyaml-dev libfftw3-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libsamplerate0-dev libtag1-dev libchromaprint-dev
+
+By default, building from the sdist also compiles static copies of these 3rdparty
+dependencies. To use the system packages installed above instead, set
+``ESSENTIA_WHEEL_SKIP_3RDPARTY=1``::
+
+  ESSENTIA_WHEEL_SKIP_3RDPARTY=1 pip install --no-binary essentia essentia
+
+Passing ``--no-binary essentia`` forces pip to build from the sdist even when a prebuilt wheel
+exists, which is useful to verify that the source build works on your platform.
+
+
 Windows, Android, iOS
 ---------------------
 Cross-compile Essentia from Linux/macOS (see below).
