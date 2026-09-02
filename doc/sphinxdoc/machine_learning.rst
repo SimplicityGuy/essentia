@@ -27,7 +27,7 @@ Essentia with TensorFlow support is available for Linux and macOS as a separate 
 Building Essentia with TensorFlow support 
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 Alternatively, we provide instructions to build Essentia from source and link it against the shared TensorFlow libraries.
-To avoid collisions when importing both Essentia and TensorFlow in Python, we use the shared libraries within the Python package of TensorFlow itself instead of linking against the official `libtensorflow <https://www.tensorflow.org/install/lang_c>`_.
+To avoid collisions when importing both Essentia and TensorFlow in Python, we link against the shared libraries inside the TensorFlow Python package itself rather than against a separate copy of `libtensorflow <https://www.tensorflow.org/install/lang_c>`_.
 
 Follow these steps to build and install Essentia with TensorFlow support:
 
@@ -37,23 +37,25 @@ At least pip version ≥19.3 is required:
 
     pip3 install --upgrade pip
 
-Install TensorFlow (tested for TensorFlow 2.5, 2.8, 2.12):
+Install TensorFlow. Version 2.13 is the minimum, because from that release the C API is exported by ``libtensorflow_cc``; earlier wheels exported it from the Python wrapper extension, which cannot be linked against:
 
 .. code-block::
 
-    pip3 install tensorflow
+    pip3 install "tensorflow>=2.13"
 
-Clone Essentia: 
+Clone Essentia:
 
 .. code-block::
 
     git clone https://github.com/MTG/essentia.git
 
-Run `setup_from_python.sh` (may require `sudo`). This script exposes the shared libraries contained in the TensorFlow wheel so we can link against them:
+Generate a ``tensorflow.pc`` describing the libraries and headers inside that wheel. The script only writes symlinks and the ``tensorflow.pc`` itself, so pick a prefix you own; the default of ``/usr/local`` needs ``sudo`` on most systems:
 
 .. code-block::
 
-    cd essentia && src/3rdparty/tensorflow/setup_from_python.sh
+    cd essentia
+    python3 src/3rdparty/tensorflow/setup_tensorflow.py --prefix ~/.local
+    export PKG_CONFIG_PATH=~/.local/lib/pkgconfig:$PKG_CONFIG_PATH
 
 Install the `dependencies <https://essentia.upf.edu/installing.html#installing-dependencies-on-linux>`_ for Essentia with Python 3 (may require `sudo`):
 
@@ -67,6 +69,8 @@ Configure Essentia with TensorFlow and Python 3:
 .. code-block::
 
     python3 waf configure --build-static --with-python --with-tensorflow
+
+Configuration fails here, rather than at import time, if the ``tensorflow.pc`` on ``PKG_CONFIG_PATH`` names a library that does not export the C API. The error reports the ``.pc`` it used, the flags it took from it, and the libraries it tried to link.
 
 
 Build everything:
