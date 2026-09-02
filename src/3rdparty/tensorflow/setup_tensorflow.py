@@ -79,14 +79,23 @@ def die(message):
 
 
 def locate_package(python):
-    """Return the directory of the tensorflow package importable by `python`."""
+    """Return the directory of the tensorflow package importable by `python`.
+
+    Only stdout is read. Importing TensorFlow writes an unconditional line to
+    stderr -- "Could not find cuda drivers" on linux, "This TensorFlow binary is
+    optimized to use available CPU instructions" on macOS -- and folding that
+    into stdout puts a log line in the middle of the path. stderr is still
+    captured, but separately, so a failing import can still be reported in full.
+    """
     code = 'import os.path, tensorflow; print(os.path.dirname(tensorflow.__file__))'
     try:
-        out = subprocess.check_output([python, '-c', code], stderr=subprocess.STDOUT)
+        process = subprocess.Popen([python, '-c', code],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = process.communicate()
     except OSError as error:
         die('could not run %s: %s' % (python, error))
-    except subprocess.CalledProcessError as error:
-        detail = error.output.decode('utf-8', 'replace').strip()
+    if process.returncode != 0:
+        detail = err.decode('utf-8', 'replace').strip()
         die('%s cannot import tensorflow.\n\n%s\n\n'
             'Install it (`%s -m pip install "tensorflow>=%d.%d"`), or pass --package-dir '
             'to point at an unpacked wheel.'
