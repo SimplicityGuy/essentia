@@ -36,7 +36,7 @@ Essentia depends on (at least) the following libraries:
 
 - `Eigen <http://eigen.tuxfamily.org/>`_: for linear algebra
 - `FFTW <http://www.fftw.org>`_: for the FFT implementation *(optional)*
-- `libavcodec/libavformat/libavutil/libswresample <http://ffmpeg.org/>`_ (from the FFmpeg/LibAv project): for loading/saving any type of audio files *(optional)*
+- `libavcodec/libavformat/libavutil/libswresample <http://ffmpeg.org/>`_ (from the FFmpeg/LibAv project), FFmpeg >= 5.1 or an equivalent LibAv release: for loading/saving any type of audio files *(optional)*
 - `libsamplerate <https://libsndfile.github.io/libsamplerate/>`_: for resampling audio *(optional)*
 - `TagLib <http://developer.kde.org/~wheeler/taglib.html>`_: for reading audio metadata tags *(optional)*
 - `LibYAML <http://pyyaml.org/wiki/LibYAML>`_: for YAML files input/output *(optional)*
@@ -59,7 +59,34 @@ In order to use Python 3 bindings for the library, you might also need to instal
 
 Note that, depending on the version of Essentia, different versions of ``libav*`` and ``libtag1-dev`` packages are required. See `release notes for official releases <https://github.com/MTG/essentia/releases>`_.
 
-Since the 2.1-beta3 release of Essentia, the required version of TagLib (``libtag1-dev``) is greater or equal to ``1.9``. The required version of LibAv (``libavcodec-dev``, ``libavformat-dev``, ``libavutil-dev`` and ``libswresample-dev``) is greater or equal to ``10``. The appropriate versions are distributed in Ubuntu 14.10 or later, and in Debian wheezy-backports. If you want to install Essentia on older versions of Ubuntu/Debian, you will have to `install a proper LibAv version from source <FAQ.html#build-essentia-on-ubuntu-14-04-or-earlier>`_.
+Since the 2.1-beta3 release of Essentia, the required version of TagLib (``libtag1-dev``) is greater or equal to ``1.9``.
+
+FFmpeg / LibAv version requirement
+"""""""""""""""""""""""""""""""""
+
+Essentia's audio loading/writing code uses the ``AVChannelLayout`` API, which FFmpeg
+introduced in its 5.1 release. The ``configure`` step therefore requires, via pkg-config,
+at least:
+
+- ``libavcodec`` >= 59.37
+- ``libavformat`` >= 59.27
+- ``libavutil`` >= 57.28
+- ``libswresample`` >= 4.7
+
+These floors are declared once, as named constants, in ``src/wscript``. If an older
+FFmpeg/LibAv is found on ``PKG_CONFIG_PATH``, ``configure`` fails immediately with the
+found version, the ``.pc`` file it came from, and the minimum required version, rather
+than letting the build fail deep inside a C++ compile on ``ch_layout``. ``configure`` also
+compiles a small probe that uses ``AVChannelLayout`` directly, to guard against a
+distribution reporting a satisfying version string without actually shipping that API. On
+success, ``configure`` prints the selected ``libavcodec``/``libavformat``/``libavutil``/
+``libswresample`` versions and their ``.pc`` file paths, so that when more than one FFmpeg
+is installed, the one actually picked up via ``PKG_CONFIG_PATH`` is visible in the log.
+
+If your distribution's FFmpeg/LibAv is older than this floor, `install a newer FFmpeg
+version from source <FAQ.html#build-essentia-on-ubuntu-14-04-or-earlier>`_, or build one
+under a separate prefix and point ``PKG_CONFIG_PATH`` (or ``./waf configure
+--pkg-config-path``) at its ``pkgconfig`` directory.
 
 If you are willing to use Essentia with a TensorFlow wrapper in C++, install the TensorFlow shared library using a helper script inside our source code::
 
@@ -87,7 +114,7 @@ Install prerequisites::
 
 Install Essentia's dependencies::
 
-  brew install eigen libyaml fftw ffmpeg@2.8 libsamplerate libtag chromaprint tensorflow
+  brew install eigen libyaml fftw ffmpeg libsamplerate libtag chromaprint tensorflow
 
 `Install Python environment using Homebrew <http://docs.python-guide.org/en/latest/starting/install/osx>`_ (Note that you are advised to do as described here and there are `good reasons to do so <http://docs.python-guide.org/en/latest/starting/install/osx/>`_. You will most probably encounter installation errors when using Python/NumPy preinstalled with macOS.)::
 
