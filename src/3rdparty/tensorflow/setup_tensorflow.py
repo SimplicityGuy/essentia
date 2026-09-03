@@ -37,7 +37,7 @@ import argparse
 import os
 import subprocess
 import sys
-from os.path import abspath, dirname, exists, isdir, join
+from os.path import abspath, basename, dirname, exists, isdir, join
 
 # Minimum pip TensorFlow whose layout this script understands.
 MIN_VERSION = (2, 13)
@@ -55,14 +55,21 @@ C_API_HEADER = join('tensorflow', 'c', 'c_api.h')
 PC_TEMPLATE = """prefix={prefix}
 libdir={libdir}
 includedir={includedir}
+package_dir={package_dir}
 
 Name: tensorflow
 Description: TensorFlow C API from the pip tensorflow package
 Version: {version}
 Requires:
-Libs: -L${{libdir}} {libs} -Wl,-rpath,{rpath}
+Libs: -L${{libdir}} {libs} -Wl,-rpath,{rpath}{rpath_link}
 Cflags: -I${{includedir}}
 """
+
+# `package_dir` above is not consumed by the linker. It records where the pip package
+# actually lives, so that `pkg-config --variable=package_dir tensorflow` answers the
+# question without importing TensorFlow. src/wscript reads it when
+# --with-tensorflow-pip-rpath / ESSENTIA_TENSORFLOW_PIP_RPATH asks for a wheel build,
+# and the libdir above is no help there: it holds symlinks, not the real libraries.
 
 
 def die(message):
@@ -72,14 +79,23 @@ def die(message):
 
 
 def locate_package(python):
-    """Return the directory of the tensorflow package importable by `python`."""
+    """Return the directory of the tensorflow package importable by `python`.
+
+    Only stdout is read. Importing TensorFlow writes an unconditional line to
+    stderr -- "Could not find cuda drivers" on linux, "This TensorFlow binary is
+    optimized to use available CPU instructions" on macOS -- and folding that
+    into stdout puts a log line in the middle of the path. stderr is still
+    captured, but separately, so a failing import can still be reported in full.
+    """
     code = 'import os.path, tensorflow; print(os.path.dirname(tensorflow.__file__))'
     try:
-        out = subprocess.check_output([python, '-c', code], stderr=subprocess.STDOUT)
+        process = subprocess.Popen([python, '-c', code],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out, err = process.communicate()
     except OSError as error:
         die('could not run %s: %s' % (python, error))
-    except subprocess.CalledProcessError as error:
-        detail = error.output.decode('utf-8', 'replace').strip()
+    if process.returncode != 0:
+        detail = err.decode('utf-8', 'replace').strip()
         die('%s cannot import tensorflow.\n\n%s\n\n'
             'Install it (`%s -m pip install "tensorflow>=%d.%d"`), or pass --package-dir '
             'to point at an unpacked wheel.'
@@ -144,6 +160,33 @@ def find_libraries(package_dir):
     return [(stem, found[stem]) for stem in stems]
 
 
+def find_rpath_link_dirs(package_dir):
+    """Return directories ld needs on its *link-time* search path, as -rpath-link flags.
+
+    auditwheel builds the linux tensorflow wheel by moving the libraries it vendored into
+    a sibling `<distribution>.libs` directory and pointing libtensorflow_cc's RPATH at it.
+    That is enough at run time, but not when ld links an executable against
+    libtensorflow_cc: ld resolves DT_NEEDED transitively and stops with
+    "undefined reference to `__kmpc_fork_call'" unless it can find libomp-<hash>.so.5.
+    -rpath-link puts the directory on ld's search path without recording it in the binary,
+    which is what we want -- at run time libtensorflow_cc finds its own dependencies.
+
+    Empty on macOS, where the dylibs have no such sibling directory and ld64 has no
+    -rpath-link.
+    """
+    if sys.platform == 'darwin':
+        return []
+
+    parent = dirname(package_dir)
+    prefix = basename(package_dir)
+    dirs = []
+    for entry in sorted(os.listdir(parent)):
+        if (entry.startswith(prefix) and entry.endswith('.libs')
+                and isdir(join(parent, entry))):
+            dirs.append(join(parent, entry))
+    return dirs
+
+
 def find_includedir(package_dir):
     """Return the include dir from which <tensorflow/c/c_api.h> resolves."""
     includedir = join(package_dir, 'include')
@@ -193,6 +236,7 @@ def main():
 
     libraries = find_libraries(package_dir)
     includedir = find_includedir(package_dir)
+    rpath_link_dirs = find_rpath_link_dirs(package_dir)
 
     libdir = join(abspath(args.prefix), 'lib')
     pkgconfig_dir = join(libdir, 'pkgconfig')
@@ -217,7 +261,9 @@ def main():
         includedir=includedir,
         version=version,
         libs=' '.join('-l%s' % stem for stem, _ in libraries),
-        rpath=package_dir)
+        rpath=package_dir,
+        rpath_link=''.join(' -Wl,-rpath-link,%s' % path for path in rpath_link_dirs),
+        package_dir=package_dir)
 
     path = join(pkgconfig_dir, 'tensorflow.pc')
     with open(path, 'w') as pcfile:

@@ -174,6 +174,71 @@ its ``Libs`` must name a library that exports the C API. ``libtensorflow_framewo
 and the Python wrapper extension ``_pywrap_tensorflow_internal`` do not, on their own.
 
 
+Building a wheel against a pip TensorFlow
+"""""""""""""""""""""""""""""""""""""""""
+
+This part is for people packaging Essentia, not for people building it for their own
+machine. Skip it unless you are producing a wheel.
+
+A wheel built the ordinary way carries a copy of every library it links. For the
+``essentia-tensorflow`` wheels that is a 600 MB copy of TensorFlow, roughly 90 per cent
+of the download, for something the user very likely has installed already.
+``--with-tensorflow-pip-rpath`` builds a wheel that leaves TensorFlow out and loads it
+from the ``tensorflow`` package next door in ``site-packages`` instead::
+
+  pip3 install "tensorflow>=2.13"
+  python3 src/3rdparty/tensorflow/setup_tensorflow.py --prefix ~/.local
+  export PKG_CONFIG_PATH=~/.local/lib/pkgconfig:$PKG_CONFIG_PATH
+  python3 waf configure --with-python --with-tensorflow --with-tensorflow-pip-rpath
+
+The flag adds rpath entries, and ``-Wl,-headerpad_max_install_names`` on macOS, to both
+``libessentia`` and the Python extension. A relative one -- ``$ORIGIN/../tensorflow``,
+or ``@loader_path/../tensorflow`` on macOS -- resolves TensorFlow from an installed
+wheel, and is the entry that ships. An absolute one, to the TensorFlow package the build
+linked against, exists only so that the wheel repair tools can *resolve* the libraries
+they are told to exclude: exclusion happens after resolution, so ``delocate-wheel
+--exclude`` fails with "Could not find all dependencies" without it. Both tools drop it
+again on their way out. On ELF platforms a third entry, a plain ``$ORIGIN``, ends the
+list; the comment on ``TENSORFLOW_PIP_RPATHS`` in ``src/wscript`` explains why it has to
+be there.
+
+Repair the wheel with TensorFlow excluded::
+
+  # linux
+  auditwheel repair --exclude libtensorflow_cc.so.2 \
+      --exclude libtensorflow_framework.so.2 -w dist/ <wheel>
+  # macOS
+  delocate-wheel --exclude libtensorflow_cc --exclude libtensorflow_framework \
+      -w dist/ <wheel>
+
+``auditwheel`` keeps the relative entry on the extension and appends its own, giving
+``$ORIGIN/../tensorflow:$ORIGIN:$ORIGIN/../<distribution>.libs``. It does *not* keep it
+on the copy of ``libessentia`` it vendors, whose rpath it overwrites with ``$ORIGIN``
+unconditionally; that copy still finds TensorFlow because the extension's entry is a
+``DT_RPATH``, which the loader also searches for the libraries the extension pulls in.
+``delocate`` keeps the entry on both.
+
+The resulting wheel needs ``tensorflow`` at run time and should declare it as a
+dependency: without it, ``import essentia.standard`` fails with an ``ImportError``
+naming ``libtensorflow_cc``. No import-time shim is needed, and none should be added --
+in particular a ``ctypes`` preload with ``RTLD_GLOBAL`` crashes the process.
+
+Setting the environment variable ``ESSENTIA_TENSORFLOW_PIP_RPATH`` is equivalent to
+passing the flag, and is the form to use when building wheels: ``setup.py`` runs
+``waf configure`` a second time, for the bindings alone, and only the environment
+reaches that invocation. Set it to ``1`` to have the build locate TensorFlow itself
+(from ``tensorflow.pc``, or from the interpreter running the configure), or to the
+``site-packages/tensorflow`` directory to name it outright, which is what a wheel build
+wants because the interpreter that builds the bindings usually has no TensorFlow of its
+own::
+
+  export ESSENTIA_TENSORFLOW_PIP_RPATH=$(python3 -c 'import tensorflow, os.path;
+      print(os.path.dirname(tensorflow.__file__))')
+
+Neither the flag nor the variable is on by default: an ordinary source build links and
+runs exactly as it did before.
+
+
 Compiling Essentia
 ------------------
 
@@ -194,6 +259,8 @@ Use these (optional) flags:
 - ``--with-vamp`` to build Vamp plugin wrapper,
 - ``--with-gaia`` to build with Gaia support,
 - ``--with-tensorflow`` to build with TensorFlow support,
+- ``--with-tensorflow-pip-rpath`` to build a wheel that loads TensorFlow from a pip
+  ``tensorflow`` install instead of vendoring it (see `Installing TensorFlow`_),
 - ``--mode=debug`` to build in debug mode,
 - ``--with-cpptests`` to build cpptests
 
