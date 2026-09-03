@@ -37,6 +37,20 @@ environment = { PROJECT_NAME="essentia", ESSENTIA_PROJECT_NAME="${PROJECT_NAME}"
 
 # Use system's Python3 to build Essentia.
 before-all = [
+  # The builder image's FFmpeg .pc files carry -latomic, and this toolchain
+  # links with --no-as-needed, so the Python extension comes out with a NEEDED
+  # on libatomic.so.1 whether or not it uses one. It does not: `nm -D
+  # --undefined-only` on the built extension finds no __atomic_* or libat_*
+  # symbol at all. auditwheel then leaves libatomic external, because it is on
+  # the manylinux policy allowlist, and the wheel dies at import on any image
+  # that does not ship libatomic1 -- python:3.x-slim, for one. Drop the flag.
+  #
+  # aarch64 solves the same problem in packaging/build_ffmpeg.sh by rewriting
+  # -latomic to -l:libatomic.a. That is not available here: these .pc files come
+  # from the image rather than from our scripts, and the devtoolset-10
+  # libatomic.a is not built PIC, so linking it into a shared object fails with
+  # "relocation R_X86_64_32 against hidden symbol ... can not be used".
+  "sed -i -e 's/ -latomic//g' /usr/local/lib/pkgconfig/lib*.pc",
   "python3 waf configure --with-gaia --build-static --static-dependencies --pkg-config-path=\"${PKG_CONFIG_PATH}\"",
   "python3 waf",
   "python3 waf install",

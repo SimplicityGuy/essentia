@@ -7,6 +7,9 @@ jobs:
     name: ${{ matrix.os }} / ${{ matrix.config }}
     runs-on: ${{ matrix.os }}
     strategy:
+      # One platform failing says nothing about the other five, and the wheels
+      # are independent artifacts. Let them all report.
+      fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15-intel, macos-15]
         config: [cibuildwheel, cibuildwheel-tensorflow]
@@ -29,6 +32,121 @@ jobs:
         with:
           path: ./wheelhouse/*.whl
           name: artifact-${{ matrix.os }}-${{ matrix.config }}
+
+      # -----------------------------------------------------------------------------
+      # Plain essentia, x86_64. The aarch64 job has had a clean-container check since
+      # it was added; x86_64 has not, which is how a wheel that cannot be imported on
+      # a stock Debian image reached PyPI unnoticed. Same script, both ends of the
+      # supported interpreter range.
+      # -----------------------------------------------------------------------------
+      - name: Check out the test audio
+        if: success() && matrix.config == 'cibuildwheel' && matrix.os == 'ubuntu-24.04'
+        run: git submodule update --init --depth 1 test/audio
+
+      - name: Decode audio with the cp312 and cp314 wheels on stock Debian images
+        if: success() && matrix.config == 'cibuildwheel' && matrix.os == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          for pair in "python:3.12-slim cp312" "python:3.14-slim-bookworm cp314"; do
+            set -- $pair
+            echo "=== $2 on $1"
+            docker run --rm --volume "$PWD":/w --workdir /w "$1" \
+              bash -euxo pipefail -c "pip install --no-cache-dir wheelhouse/essentia-*-$2-$2-manylinux*_x86_64.whl && python packaging/verify_wheel_audio.py test/audio/recorded/*.mp3"
+          done
+
+      # -----------------------------------------------------------------------------
+      # essentia-tensorflow only. The wheel carries its own TensorFlow C library, so
+      # the two things worth proving are that the library is in there and that an
+      # installed wheel runs inference somewhere that has nothing else installed.
+      # -----------------------------------------------------------------------------
+      - name: Record the wheel contents, tags and sizes
+        if: success() && matrix.config == 'cibuildwheel-tensorflow'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(wheelhouse/*.whl)
+          if [ ${#wheels[@]} -eq 0 ]; then echo "no wheels were built"; exit 1; fi
+          status=0
+          for wheel in "${wheels[@]}"; do
+            echo "=== $(basename "$wheel")  ($(wc -c < "$wheel") bytes)"
+            unzip -l "$wheel"
+            if ! unzip -l "$wheel" | grep -qi 'libtensorflow'; then
+              echo "FAIL: the wheel ships no TensorFlow library"
+              status=1
+            fi
+          done
+          exit $status
+
+      # The inference check needs an 18 MB model from essentia.upf.edu, and that
+      # host is not always up: a 504 from it took out all three tensorflow jobs
+      # once already. Everything below the build depends on it, and nothing above
+      # does, so a bad day there costs the verification and not the wheels.
+      # Cached by content, so a warm run never contacts the host at all.
+      - name: Restore the discogs-effnet model
+        if: success() && matrix.config == 'cibuildwheel-tensorflow'
+        id: effnet-model
+        uses: actions/cache@v4
+        with:
+          path: discogs-effnet-bs64-1.pb
+          key: discogs-effnet-bs64-1-3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
+
+      - name: Fetch the discogs-effnet model
+        if: success() && matrix.config == 'cibuildwheel-tensorflow' && steps.effnet-model.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          MODEL_URL: https://essentia.upf.edu/models/music-style-classification/discogs-effnet/discogs-effnet-bs64-1.pb
+          MODEL_SHA256: 3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
+        run: |
+          curl --retry 8 --retry-all-errors --retry-delay 15 --retry-max-time 300 \
+               -sSfL -o discogs-effnet-bs64-1.pb "$MODEL_URL"
+          if command -v sha256sum > /dev/null 2>&1; then
+            actual=$(sha256sum discogs-effnet-bs64-1.pb | cut -d' ' -f1)
+          else
+            actual=$(shasum -a 256 discogs-effnet-bs64-1.pb | cut -d' ' -f1)
+          fi
+          if [ "$actual" != "$MODEL_SHA256" ]; then
+            echo "checksum mismatch for $MODEL_URL"
+            echo "  expected $MODEL_SHA256"
+            echo "  actual   $actual"
+            exit 1
+          fi
+          echo "discogs-effnet-bs64-1.pb verified ($(wc -c < discogs-effnet-bs64-1.pb) bytes)"
+
+      # Two stock Debian images, not the manylinux builder: no libtensorflow, no
+      # libessentia, no toolchain, and nothing installed but the wheel itself.
+      # 3.14 is the interpreter that matters most -- it is the one downstream
+      # pins -- and it is also the one no upstream TensorFlow wheel exists for,
+      # which is why the library is vendored rather than depended on.
+      - name: Run EfficientNet inference with the cp312 wheel on python:3.12-slim
+        if: success() && matrix.config == 'cibuildwheel-tensorflow' && matrix.os == 'ubuntu-24.04'
+        run: |
+          docker run --rm --volume "$PWD":/w --workdir /w python:3.12-slim \
+            bash -euxo pipefail -c 'pip install --no-cache-dir wheelhouse/essentia_tensorflow-*-cp312-cp312-manylinux*_x86_64.whl && python packaging/verify_wheel_effnet.py discogs-effnet-bs64-1.pb'
+
+      - name: Run EfficientNet inference with the cp314 wheel on python:3.14-slim-bookworm
+        if: success() && matrix.config == 'cibuildwheel-tensorflow' && matrix.os == 'ubuntu-24.04'
+        run: |
+          docker run --rm --volume "$PWD":/w --workdir /w python:3.14-slim-bookworm \
+            bash -euxo pipefail -c 'pip install --no-cache-dir wheelhouse/essentia_tensorflow-*-cp314-cp314-manylinux*_x86_64.whl && python packaging/verify_wheel_effnet.py discogs-effnet-bs64-1.pb'
+
+      # The macOS equivalent: empty venvs on the runner, one per end of the
+      # supported range. The interpreters are the framework builds cibuildwheel
+      # installed for the wheels themselves.
+      - name: Run EfficientNet inference with the cp312 and cp314 wheels in clean venvs
+        if: success() && matrix.config == 'cibuildwheel-tensorflow' && startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          for version in 3.12 3.14; do
+            tag=cp$(echo "$version" | tr -d .)
+            python=$(command -v "python$version" || true)
+            [ -n "$python" ] || python="/Library/Frameworks/Python.framework/Versions/$version/bin/python$version"
+            echo "=== $tag using $python"
+            "$python" -m venv "/tmp/effnet-$version"
+            "/tmp/effnet-$version/bin/pip" install --quiet --no-cache-dir \
+              wheelhouse/essentia_tensorflow-*-"$tag"-"$tag"-macosx_*.whl
+            "/tmp/effnet-$version/bin/pip" show essentia-tensorflow | grep -E '^(Name|Version|Requires):'
+            "/tmp/effnet-$version/bin/python" packaging/verify_wheel_effnet.py discogs-effnet-bs64-1.pb
+          done
 
   # ---------------------------------------------------------------------------------
   # sdist: publish a source distribution and verify `pip install --no-binary` builds
