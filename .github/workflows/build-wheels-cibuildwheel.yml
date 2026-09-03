@@ -331,14 +331,26 @@ jobs:
 
   # Linux aarch64, on a native arm64 runner (no QEMU).
   #
-  # Deliberately a separate job rather than another row of the matrix above:
-  # aarch64 has to build its own static 3rdparty dependencies (there is no
-  # mtgupf/essentia-builds image for it) behind a cache, and it has no
-  # essentia-tensorflow counterpart yet, so the `config` axis would be
-  # half-empty.
+  # Deliberately a separate job rather than more rows of the build_wheels matrix
+  # above: aarch64 has to build its own static 3rdparty dependencies -- there is
+  # no mtgupf/essentia-builds image for it -- behind a cache, and no other row
+  # needs that step.
+  #
+  # It carries the same `config` axis, both configs in one job rather than two
+  # jobs, because everything except the file handed to cibuildwheel is identical
+  # and the two rows want the same dependencies out of the same image. One cache
+  # entry serves both, so the second row's dependency build is free on a warm run
+  # and, cold, is the same three minutes either shape would pay. A parallel job
+  # would be a seventy-line copy of this one differing in a single argument.
   build_wheels_linux_aarch64:
-    name: ubuntu-24.04-arm / cibuildwheel
+    name: ubuntu-24.04-arm / ${{ matrix.config }}
     runs-on: ubuntu-24.04-arm
+    strategy:
+      # Same reasoning as build_wheels: the two configs are independent
+      # artifacts and one failing says nothing about the other.
+      fail-fast: false
+      matrix:
+        config: [cibuildwheel, cibuildwheel-tensorflow]
 
     steps:
       - uses: actions/checkout@v6
@@ -351,19 +363,21 @@ jobs:
 
       - name: Resolve the manylinux aarch64 builder image
         id: image
-        # Read the image back out of cibuildwheel.toml so the dependency
-        # prebuild below and the wheel build cannot drift apart, and so the
-        # cache is invalidated when the image is bumped.
+        # Read the image back out of the config file this row will build with, so
+        # the dependency prebuild below and the wheel build cannot drift apart,
+        # and so the cache is invalidated when the image is bumped. Both configs
+        # pin the same image, which is what lets them share one cache entry; if
+        # they ever diverge they simply stop sharing it rather than poisoning it.
         run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
           import re, tomllib
 
-          with open("cibuildwheel.toml", "rb") as f:
+          with open("${{ matrix.config }}.toml", "rb") as f:
               image = tomllib.load(f)["tool"]["cibuildwheel"]["linux"]["manylinux-aarch64-image"]
 
           print(f"image={image}")
           print(f"slug={re.sub(r'[^A-Za-z0-9._-]', '-', image)}")
-          PY
+          EOF
 
       - name: Restore the static 3rdparty dependencies
         id: deps-cache
@@ -375,6 +389,10 @@ jobs:
           # copies the project directory into the build container, so anything
           # restored here is visible to before-all at the same absolute path
           # (/project/packaging/debian_3rdparty) it was built at.
+          #
+          # The key deliberately does not mention matrix.config: the dependencies
+          # are the same libraries built by the same script either way, and
+          # TensorFlow is not among them.
           path: |
             packaging/debian_3rdparty/lib
             packaging/debian_3rdparty/include
@@ -384,8 +402,8 @@ jobs:
         if: steps.deps-cache.outputs.cache-hit != 'true'
         # Built in the same image cibuildwheel will use, bind-mounted at the
         # same path (/project) cibuildwheel uses, because the generated .pc
-        # files record absolute paths. Around 25 minutes cold; the cache above
-        # makes a warm run skip this step entirely.
+        # files record absolute paths. Around 3 minutes on a 4-vCPU runner; the
+        # cache above makes a warm run skip this step entirely.
         run: |
           docker run --rm \
             --volume "$PWD":/project \
@@ -397,26 +415,102 @@ jobs:
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.2.1
         with:
-          config-file: cibuildwheel.toml
+          config-file: ${{ matrix.config }}.toml
 
       - uses: actions/upload-artifact@v6
         with:
           path: ./wheelhouse/*.whl
-          name: artifact-ubuntu-24.04-arm-cibuildwheel
+          name: artifact-ubuntu-24.04-arm-${{ matrix.config }}
+
+      # essentia-tensorflow only. The wheel carries its own TensorFlow C library,
+      # so the first thing worth proving is that the library is in there: a wheel
+      # that quietly lost it still installs and still imports, and only fails
+      # when a TensorflowPredict algorithm is finally called.
+      - name: Record the wheel contents, tags and sizes
+        if: success() && matrix.config == 'cibuildwheel-tensorflow'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          wheels=(wheelhouse/*.whl)
+          if [ ${#wheels[@]} -eq 0 ]; then echo "no wheels were built"; exit 1; fi
+          status=0
+          for wheel in "${wheels[@]}"; do
+            echo "=== $(basename "$wheel")  ($(wc -c < "$wheel") bytes)"
+            unzip -l "$wheel"
+            if ! unzip -l "$wheel" | grep -qi 'libtensorflow'; then
+              echo "FAIL: the wheel ships no TensorFlow library"
+              status=1
+            fi
+          done
+          exit $status
 
       - name: Check out the test audio
         run: git submodule update --init --depth 1 test/audio
 
-      - name: Decode audio with the cp312 wheel on arm64v8/python:3.12-slim
-        # End-to-end check on a stock arm64 Debian image rather than the
-        # manylinux builder: the wheel has to install and decode MP3s with no
-        # system FFmpeg, no libessentia and no build toolchain present.
+      - name: Decode audio with the cp312 and cp314 wheels on stock arm64 Debian images
+        # End-to-end check on stock arm64 Debian images rather than the manylinux
+        # builder: the wheel has to install and decode MP3s with no system
+        # FFmpeg, no libessentia and no build toolchain present. Both ends of the
+        # supported interpreter range, and both configs -- the essentia-tensorflow
+        # wheel vendors the same FFmpeg and has the same decoding path.
+        shell: bash
         run: |
-          docker run --rm \
-            --volume "$PWD":/w \
-            --workdir /w \
-            arm64v8/python:3.12-slim \
-            bash -euxo pipefail -c 'pip install --no-cache-dir wheelhouse/essentia-*-cp312-cp312-manylinux*_aarch64.whl && python packaging/verify_wheel_audio.py test/audio/recorded/*.mp3'
+          case "${{ matrix.config }}" in
+            cibuildwheel-tensorflow) package=essentia_tensorflow ;;
+            *)                       package=essentia ;;
+          esac
+          for pair in "arm64v8/python:3.12-slim cp312" "arm64v8/python:3.14-slim-bookworm cp314"; do
+            set -- $pair
+            echo "=== $2 on $1"
+            docker run --rm --volume "$PWD":/w --workdir /w "$1" \
+              bash -euxo pipefail -c "pip install --no-cache-dir wheelhouse/$package-*-$2-$2-manylinux*_aarch64.whl && python packaging/verify_wheel_audio.py test/audio/recorded/*.mp3"
+          done
+
+      # The inference check needs an 18 MB model from essentia.upf.edu, and that
+      # host is not always up. Everything below the build depends on it and
+      # nothing above does, so a bad day there costs the verification and not the
+      # wheels. Cached by content, so a warm run never contacts the host at all.
+      - name: Restore the discogs-effnet model
+        if: success() && matrix.config == 'cibuildwheel-tensorflow'
+        id: effnet-model
+        uses: actions/cache@v4
+        with:
+          path: discogs-effnet-bs64-1.pb
+          key: discogs-effnet-bs64-1-3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
+
+      - name: Fetch the discogs-effnet model
+        if: success() && matrix.config == 'cibuildwheel-tensorflow' && steps.effnet-model.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          MODEL_URL: https://essentia.upf.edu/models/music-style-classification/discogs-effnet/discogs-effnet-bs64-1.pb
+          MODEL_SHA256: 3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
+        run: |
+          curl --retry 8 --retry-all-errors --retry-delay 15 --retry-max-time 300 \
+               -sSfL -o discogs-effnet-bs64-1.pb "$MODEL_URL"
+          actual=$(sha256sum discogs-effnet-bs64-1.pb | cut -d' ' -f1)
+          if [ "$actual" != "$MODEL_SHA256" ]; then
+            echo "checksum mismatch for $MODEL_URL"
+            echo "  expected $MODEL_SHA256"
+            echo "  actual   $actual"
+            exit 1
+          fi
+          echo "discogs-effnet-bs64-1.pb verified ($(wc -c < discogs-effnet-bs64-1.pb) bytes)"
+
+      # `pip show` is printed as well as the inference result: the point of
+      # vendoring libtensorflow is that the runtime dependency list stays numpy,
+      # pyyaml and six, with no `tensorflow` package anywhere. cp314 is the case
+      # that decides the design -- no upstream TensorFlow wheel exists for 3.14
+      # at any version, on any architecture.
+      - name: Run EfficientNet inference with the cp312 and cp314 wheels on stock arm64 Debian images
+        if: success() && matrix.config == 'cibuildwheel-tensorflow'
+        shell: bash
+        run: |
+          for pair in "arm64v8/python:3.12-slim cp312" "arm64v8/python:3.14-slim-bookworm cp314"; do
+            set -- $pair
+            echo "=== $2 on $1"
+            docker run --rm --volume "$PWD":/w --workdir /w "$1" \
+              bash -euxo pipefail -c "pip install --no-cache-dir wheelhouse/essentia_tensorflow-*-$2-$2-manylinux*_aarch64.whl && pip show essentia-tensorflow | grep -E '^(Name|Version|Requires):' && python packaging/verify_wheel_effnet.py discogs-effnet-bs64-1.pb"
+          done
 
   # =====================================================================================
   # test_wheels: run the Python unit test suite (test/src/unittests) against an
