@@ -23,6 +23,25 @@
 # The repair step is the stock one, with no --exclude: auditwheel and delocate
 # vendor libtensorflow exactly as they vendor FFmpeg and the rest.
 
+[tool.cibuildwheel]
+
+# One test-command for every platform, including the aarch64 override
+# ess-kx56.3 adds below: TOML platform sections fully replace a same-named
+# top-level key, so leaving test-command out of [tool.cibuildwheel.linux] /
+# [tool.cibuildwheel.macos] and their overrides is what makes them fall
+# through to this shared definition, rather than needing to repeat it.
+#
+# packaging/verify_wheel_effnet.py always checks (no model needed) that the
+# installed wheel vendors libtensorflow and declares no `tensorflow`
+# dependency, then runs TensorflowPredictEffnetDiscogs and asserts a finite
+# (N, 1280) float32 embedding -- unless the model that test-sources copied in
+# is missing or empty, in which case it logs a loud warning and skips only
+# the inference step. That happens when the workflow's pre-build model
+# restore (build_wheels job, before "Build wheels" runs) hit a cold cache and
+# a dead essentia.upf.edu; it stages an empty placeholder rather than failing
+# the build, since the model download is not on cibuildwheel's critical path.
+test-command = "python packaging/verify_wheel_effnet.py discogs-effnet-bs64-1.pb"
+
 [tool.cibuildwheel.linux]
 
 manylinux-x86_64-image = "mtgupf/essentia-builds:manylinux2014_x86_64"
@@ -73,7 +92,15 @@ before-all = [
   "sed 's/^name *= *\"essentia\"$/name = \"essentia-tensorflow\"/' pyproject.toml > pyproject.toml.patched && mv pyproject.toml.patched pyproject.toml"
 ]
 
-test-command = "python -c 'import essentia; import essentia.standard; import essentia.streaming; from essentia.standard import MonoLoader, MetadataReader, YamlInput, Chromaprinter, TensorflowPredict'"
+# test-command is inherited from [tool.cibuildwheel] above, for every
+# interpreter this section builds and for the aarch64 override.
+#
+# discogs-effnet-bs64-1.pb is staged at the project root by the workflow,
+# before "Build wheels" runs (see build_wheels in
+# .github/workflows/build-wheels-cibuildwheel.yml); test-sources copies both
+# it and the verification script into cibuildwheel's isolated per-interpreter
+# test directory, where test-command's relative paths resolve.
+test-sources = ["packaging/verify_wheel_effnet.py", "discogs-effnet-bs64-1.pb"]
 
 
 [tool.cibuildwheel.macos]
@@ -106,10 +133,11 @@ before-all = [
   "sed 's/^name *= *\"essentia\"$/name = \"essentia-tensorflow\"/' pyproject.toml > pyproject.toml.patched && mv pyproject.toml.patched pyproject.toml"
 ]
 
-# Imports only. Real inference needs a 18 MB model from essentia.upf.edu, and
-# anything the build step depends on makes that host able to fail the build; the
-# workflow runs the inference check after the wheels exist instead.
-test-command = "python -c 'import essentia; import essentia.standard; import essentia.streaming; from essentia.standard import MonoLoader, MetadataReader, YamlInput, Chromaprinter, TensorflowPredict'"
+# test-command is inherited from [tool.cibuildwheel] above; test-sources is
+# repeated here (identical to the linux section) rather than hoisted to the
+# top level so it stays next to the platform it ships the model for. See the
+# linux section for what the model-staging workflow step does on a dead host.
+test-sources = ["packaging/verify_wheel_effnet.py", "discogs-effnet-bs64-1.pb"]
 
 
 [[tool.cibuildwheel.overrides]]
