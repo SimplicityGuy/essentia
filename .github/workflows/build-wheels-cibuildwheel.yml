@@ -103,13 +103,15 @@ jobs:
           name: artifact-${{ matrix.os }}-${{ matrix.config }}
 
       # -----------------------------------------------------------------------------
-      # Plain essentia, x86_64. The aarch64 job has had a clean-container check since
-      # it was added; x86_64 has not, which is how a wheel that cannot be imported on
-      # a stock Debian image reached PyPI unnoticed. Same script, both ends of the
-      # supported interpreter range.
+      # Plain essentia. The aarch64 job has had a clean-container check since it was
+      # added; Linux x86_64 has one above, added for the same reason macOS gets one
+      # here: an import break reaching PyPI unnoticed because the only checks run
+      # against the manylinux builder or the cibuildwheel test venv, both of which
+      # have more installed than a user's machine does. Same script, both ends of the
+      # supported interpreter range, on every platform this job builds for.
       # -----------------------------------------------------------------------------
       - name: Check out the test audio
-        if: success() && matrix.config == 'cibuildwheel' && matrix.os == 'ubuntu-24.04'
+        if: success() && matrix.config == 'cibuildwheel' && (matrix.os == 'ubuntu-24.04' || startsWith(matrix.os, 'macos'))
         run: git submodule update --init --depth 1 test/audio
 
       - name: Decode audio with the cp312 and cp314 wheels on stock Debian images
@@ -121,6 +123,26 @@ jobs:
             echo "=== $2 on $1"
             docker run --rm --volume "$PWD":/w --workdir /w "$1" \
               bash -euxo pipefail -c "pip install --no-cache-dir wheelhouse/essentia-*-$2-$2-manylinux*_x86_64.whl && python packaging/verify_wheel_audio.py test/audio/recorded/*.mp3"
+          done
+
+      # macOS has no container to install into, so this uses fresh venvs on the
+      # runner instead -- the same shape as the essentia-tensorflow clean-venv check
+      # below, minus the model. This is the gap that let the Linux x86_64 spurious
+      # libatomic NEEDED (see fedef66e) reach PyPI unnoticed for the plain wheel: it
+      # has no clean-container/clean-venv import check on any platform before now.
+      - name: Decode audio with the cp312 and cp314 wheels in clean venvs
+        if: success() && matrix.config == 'cibuildwheel' && startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          for version in 3.12 3.14; do
+            tag=cp$(echo "$version" | tr -d .)
+            python=$(command -v "python$version" || true)
+            [ -n "$python" ] || python="/Library/Frameworks/Python.framework/Versions/$version/bin/python$version"
+            echo "=== $tag using $python"
+            "$python" -m venv "/tmp/audio-$version"
+            "/tmp/audio-$version/bin/pip" install --quiet --no-cache-dir \
+              wheelhouse/essentia-*-"$tag"-"$tag"-macosx_*.whl
+            "/tmp/audio-$version/bin/python" packaging/verify_wheel_audio.py test/audio/recorded/*.mp3
           done
 
       # -----------------------------------------------------------------------------
