@@ -412,6 +412,78 @@ jobs:
             ./packaging/build_3rdparty_static_aarch64_manylinux.sh
           sudo chown -R "$(id -u):$(id -g)" packaging/debian_3rdparty
 
+      # -----------------------------------------------------------------------------
+      # essentia-tensorflow only, and the same three steps the build_wheels job runs
+      # for the same reason. cibuildwheel-tensorflow.toml's test-command runs
+      # packaging/verify_wheel_effnet.py for every interpreter it builds, and
+      # test-sources copies discogs-effnet-bs64-1.pb in from the project root, so the
+      # file has to be staged before "Build wheels" starts. Not staging it is not a
+      # degraded check but a hard failure: cibuildwheel's copy_test_sources raises
+      # FatalError on a path that does not exist, before the script it would have run
+      # gets a chance to handle a missing model.
+      #
+      # The cache key and path are the pretest pair's, distinct from the post-build
+      # restore this job used to carry: one key across two different `path`s would
+      # make a hit on one register as a hit on the other without restoring anything.
+      # The post-build inference steps below now read this same staged copy, so the
+      # job holds one model cache rather than two.
+      #
+      # A dead essentia.upf.edu must not fail the build -- the download was moved
+      # below the build once already (fedef66e) for exactly that reason -- so both
+      # steps are continue-on-error, the fetch always exits 0, and nothing is left at
+      # .cache/ on failure, so a transient outage cannot be cached as a permanent
+      # empty result. verify_wheel_effnet.py degrades to its no-model checks, loudly.
+      # -----------------------------------------------------------------------------
+      - name: Restore the discogs-effnet model for cibuildwheel
+        if: matrix.config == 'cibuildwheel-tensorflow'
+        id: effnet-model-pretest
+        continue-on-error: true
+        uses: actions/cache@v4
+        with:
+          path: .cache/discogs-effnet-bs64-1.pb
+          key: discogs-effnet-bs64-1-pretest-3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
+
+      - name: Fetch the discogs-effnet model for cibuildwheel
+        if: matrix.config == 'cibuildwheel-tensorflow' && steps.effnet-model-pretest.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        env:
+          MODEL_URL: https://essentia.upf.edu/models/music-style-classification/discogs-effnet/discogs-effnet-bs64-1.pb
+          MODEL_SHA256: 3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
+        run: |
+          set +e
+          mkdir -p .cache
+          curl --retry 8 --retry-all-errors --retry-delay 15 --retry-max-time 300 \
+               -sSfL -o .cache/discogs-effnet-bs64-1.pb "$MODEL_URL"
+          status=$?
+          if [ $status -eq 0 ]; then
+            actual=$(sha256sum .cache/discogs-effnet-bs64-1.pb | cut -d' ' -f1)
+            if [ "$actual" = "$MODEL_SHA256" ]; then
+              echo "discogs-effnet-bs64-1.pb verified ($(wc -c < .cache/discogs-effnet-bs64-1.pb) bytes)"
+            else
+              echo "::warning::discogs-effnet-bs64-1.pb checksum mismatch (expected $MODEL_SHA256, got $actual);" \
+                   "test-command will degrade to imports only"
+              rm -f .cache/discogs-effnet-bs64-1.pb
+            fi
+          else
+            echo "::warning::failed to fetch discogs-effnet-bs64-1.pb from essentia.upf.edu after retries" \
+                 "(curl exit $status); test-command will degrade to imports only"
+          fi
+          exit 0
+
+      - name: Stage the discogs-effnet model for cibuildwheel
+        if: matrix.config == 'cibuildwheel-tensorflow'
+        shell: bash
+        run: |
+          if [ -s .cache/discogs-effnet-bs64-1.pb ]; then
+            cp .cache/discogs-effnet-bs64-1.pb discogs-effnet-bs64-1.pb
+            echo "staged discogs-effnet-bs64-1.pb ($(wc -c < discogs-effnet-bs64-1.pb) bytes) for test-sources"
+          else
+            echo "::warning::no verified discogs-effnet-bs64-1.pb available; staging an empty placeholder" \
+                 "so test-command's inference check degrades to imports only instead of failing the build"
+            : > discogs-effnet-bs64-1.pb
+          fi
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v3.2.1
         with:
@@ -422,10 +494,13 @@ jobs:
           path: ./wheelhouse/*.whl
           name: artifact-ubuntu-24.04-arm-${{ matrix.config }}
 
-      # essentia-tensorflow only. The wheel carries its own TensorFlow C library,
-      # so the first thing worth proving is that the library is in there: a wheel
-      # that quietly lost it still installs and still imports, and only fails
-      # when a TensorflowPredict algorithm is finally called.
+      # essentia-tensorflow only. Informational listing: the vendoring assertion this
+      # used to make with `unzip -l | grep -qi libtensorflow` now lives in
+      # packaging/verify_wheel_effnet.py, which cibuildwheel's test-command runs
+      # against every built interpreter's *installed* package. That follows the same
+      # import and rpath resolution a user gets, rather than grepping the archive,
+      # and it runs six times here instead of once. One script, not two divergent
+      # implementations of one assertion.
       - name: Record the wheel contents, tags and sizes
         if: success() && matrix.config == 'cibuildwheel-tensorflow'
         shell: bash
@@ -433,16 +508,10 @@ jobs:
           shopt -s nullglob
           wheels=(wheelhouse/*.whl)
           if [ ${#wheels[@]} -eq 0 ]; then echo "no wheels were built"; exit 1; fi
-          status=0
           for wheel in "${wheels[@]}"; do
             echo "=== $(basename "$wheel")  ($(wc -c < "$wheel") bytes)"
             unzip -l "$wheel"
-            if ! unzip -l "$wheel" | grep -qi 'libtensorflow'; then
-              echo "FAIL: the wheel ships no TensorFlow library"
-              status=1
-            fi
           done
-          exit $status
 
       - name: Check out the test audio
         run: git submodule update --init --depth 1 test/audio
@@ -466,45 +535,32 @@ jobs:
               bash -euxo pipefail -c "pip install --no-cache-dir wheelhouse/$package-*-$2-$2-manylinux*_aarch64.whl && python packaging/verify_wheel_audio.py test/audio/recorded/*.mp3"
           done
 
-      # The inference check needs an 18 MB model from essentia.upf.edu, and that
-      # host is not always up. Everything below the build depends on it and
-      # nothing above does, so a bad day there costs the verification and not the
-      # wheels. Cached by content, so a warm run never contacts the host at all.
-      - name: Restore the discogs-effnet model
-        if: success() && matrix.config == 'cibuildwheel-tensorflow'
-        id: effnet-model
-        uses: actions/cache@v4
-        with:
-          path: discogs-effnet-bs64-1.pb
-          key: discogs-effnet-bs64-1-3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
-
-      - name: Fetch the discogs-effnet model
-        if: success() && matrix.config == 'cibuildwheel-tensorflow' && steps.effnet-model.outputs.cache-hit != 'true'
-        shell: bash
-        env:
-          MODEL_URL: https://essentia.upf.edu/models/music-style-classification/discogs-effnet/discogs-effnet-bs64-1.pb
-          MODEL_SHA256: 3ed9af50d5367c0b9c795b294b00e7599e4943244f4cbd376869f3bfc87721b1
-        run: |
-          curl --retry 8 --retry-all-errors --retry-delay 15 --retry-max-time 300 \
-               -sSfL -o discogs-effnet-bs64-1.pb "$MODEL_URL"
-          actual=$(sha256sum discogs-effnet-bs64-1.pb | cut -d' ' -f1)
-          if [ "$actual" != "$MODEL_SHA256" ]; then
-            echo "checksum mismatch for $MODEL_URL"
-            echo "  expected $MODEL_SHA256"
-            echo "  actual   $actual"
-            exit 1
-          fi
-          echo "discogs-effnet-bs64-1.pb verified ($(wc -c < discogs-effnet-bs64-1.pb) bytes)"
-
-      # `pip show` is printed as well as the inference result: the point of
-      # vendoring libtensorflow is that the runtime dependency list stays numpy,
-      # pyyaml and six, with no `tensorflow` package anywhere. cp314 is the case
-      # that decides the design -- no upstream TensorFlow wheel exists for 3.14
-      # at any version, on any architecture.
+      # The model here is the copy staged before the build, read straight out of the
+      # workspace the container bind-mounts. cibuildwheel's test-command has already
+      # run the same script inside its own test environment for all six interpreters;
+      # this repeats it for two of them somewhere with nothing else installed at all
+      # -- no libtensorflow, no libessentia, no toolchain -- which the cibuildwheel
+      # test venv, sitting inside the manylinux builder, cannot prove.
+      #
+      # `pip show` is printed as well as the inference result: the point of vendoring
+      # libtensorflow is that the runtime dependency list stays numpy, pyyaml and six,
+      # with no `tensorflow` package anywhere. cp314 is the case that decides the
+      # design -- no upstream TensorFlow wheel exists for 3.14 at any version, on any
+      # architecture.
       - name: Run EfficientNet inference with the cp312 and cp314 wheels on stock arm64 Debian images
         if: success() && matrix.config == 'cibuildwheel-tensorflow'
         shell: bash
         run: |
+          # The containers still run without a model. verify_wheel_effnet.py's import,
+          # vendored-libtensorflow and no-tensorflow-dependency checks need neither the
+          # model nor the network, and they are the part only a clean container can
+          # prove; the script skips just the inference, with its own loud warning. This
+          # line puts the same fact in the job summary, where a degraded run is visible
+          # without opening the log.
+          if [ ! -s discogs-effnet-bs64-1.pb ]; then
+            echo "::warning::no discogs-effnet-bs64-1.pb staged (essentia.upf.edu was unreachable" \
+                 "or served a bad checksum); the clean-container checks run without inference"
+          fi
           for pair in "arm64v8/python:3.12-slim cp312" "arm64v8/python:3.14-slim-bookworm cp314"; do
             set -- $pair
             echo "=== $2 on $1"
@@ -522,8 +578,9 @@ jobs:
   # base wheel) are excluded through test/src/unittests/ci_skiplist.txt, one documented
   # reason per entry. io/AudioLoader, streaming and FrameCutter run unskipped everywhere.
   #
-  # Where an essentia-tensorflow wheel exists for the platform (x86_64 Linux, macOS
-  # arm64), a separate step installs THAT wheel into an isolated venv and smoke-tests
+  # Where an essentia-tensorflow wheel exists for the platform -- Linux x86_64, Linux
+  # aarch64 and macOS arm64, which is every platform these workflows build one for --
+  # a separate step installs THAT wheel into an isolated venv and smoke-tests
   # TensorflowPredictEffnetDiscogs end-to-end against a downloaded model.
   # =====================================================================================
   test_wheels:
@@ -538,7 +595,7 @@ jobs:
             tf_artifact: artifact-ubuntu-24.04-cibuildwheel-tensorflow
           - os: ubuntu-24.04-arm
             artifact: artifact-ubuntu-24.04-arm-cibuildwheel
-            tf_artifact: ''
+            tf_artifact: artifact-ubuntu-24.04-arm-cibuildwheel-tensorflow
           - os: macos-15
             artifact: artifact-macos-15-cibuildwheel
             tf_artifact: artifact-macos-15-cibuildwheel-tensorflow
