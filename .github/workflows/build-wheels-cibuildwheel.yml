@@ -34,6 +34,27 @@ jobs:
           name: artifact-${{ matrix.os }}-${{ matrix.config }}
 
       # -----------------------------------------------------------------------------
+      # Plain essentia, x86_64. The aarch64 job has had a clean-container check since
+      # it was added; x86_64 has not, which is how a wheel that cannot be imported on
+      # a stock Debian image reached PyPI unnoticed. Same script, both ends of the
+      # supported interpreter range.
+      # -----------------------------------------------------------------------------
+      - name: Check out the test audio
+        if: success() && matrix.config == 'cibuildwheel' && matrix.os == 'ubuntu-24.04'
+        run: git submodule update --init --depth 1 test/audio
+
+      - name: Decode audio with the cp312 and cp314 wheels on stock Debian images
+        if: success() && matrix.config == 'cibuildwheel' && matrix.os == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          for pair in "python:3.12-slim cp312" "python:3.14-slim-bookworm cp314"; do
+            set -- $pair
+            echo "=== $2 on $1"
+            docker run --rm --volume "$PWD":/w --workdir /w "$1" \
+              bash -euxo pipefail -c "pip install --no-cache-dir wheelhouse/essentia-*-$2-$2-manylinux*_x86_64.whl && python packaging/verify_wheel_audio.py test/audio/recorded/*.mp3"
+          done
+
+      # -----------------------------------------------------------------------------
       # essentia-tensorflow only. The wheel carries its own TensorFlow C library, so
       # the two things worth proving are that the library is in there and that an
       # installed wheel runs inference somewhere that has nothing else installed.
