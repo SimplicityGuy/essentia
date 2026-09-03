@@ -3,6 +3,97 @@
 Installing Essentia
 ===================
 
+Installing from PyPI (wheels)
+------------------------------
+
+.. rubric:: What changed in this release
+
+- Linux ``aarch64`` wheels are now published, for both ``essentia`` and
+  ``essentia-tensorflow``, built on native arm64 runners.
+- The macOS wheel floor is back down to ``macosx_15_0`` (it had drifted to
+  ``macosx_26_2``). That was a side effect of the Homebrew ``libtensorflow`` bottle's own
+  minimum OS version, not a property of TensorFlow itself; see `Installing TensorFlow`_
+  below for where the library comes from now.
+- The source distribution (sdist) builds cleanly again on Python 3.12 and newer: the
+  3rdparty build script is now invoked explicitly with ``bash`` instead of relying on the
+  execute bit surviving the sdist round-trip (`MTG/essentia#1462
+  <https://github.com/MTG/essentia/issues/1462>`_).
+- ``configure`` now requires FFmpeg/LibAv >= 5.1 and fails immediately, naming the version
+  found and its ``.pc`` path, instead of failing deep inside a C++ compile; see `FFmpeg /
+  LibAv version requirement`_ below.
+- ``configure --with-tensorflow`` now link-tests the TensorFlow C API (``TF_Version``,
+  ``TF_DeleteSession``) at configure time, instead of only failing later at import.
+- The published x86_64 ``essentia`` wheels no longer carry a spurious ``libatomic.so.1``
+  dependency that broke ``import essentia`` on images that don't ship ``libatomic1``, such
+  as ``python:slim`` (`MTG/essentia#1541
+  <https://github.com/MTG/essentia/issues/1541>`_).
+
+Supported platforms
+""""""""""""""""""""
+
+Both ``essentia`` and ``essentia-tensorflow`` publish wheels for CPython 3.9 through 3.14
+(free-threaded ``t`` builds are not built) on:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 16 20 30 34
+
+   * - Platform
+     - Wheel tag
+     - ``essentia-tensorflow``'s TensorFlow C library
+     - Notes
+   * - Linux x86_64
+     - ``manylinux2014`` (glibc 2.17)
+     - Google's official tarball, TensorFlow 2.18.1
+     -
+   * - Linux aarch64
+     - ``manylinux_2_28`` (glibc 2.28)
+     - Homebrew ``libtensorflow`` 2.21.0 bottle
+     - No gaia-backed algorithms (``GaiaTransform``, ``MusicExtractorSVM``): Gaia needs
+       Qt 4.8, which has no AArch64 build.
+   * - macOS arm64
+     - ``macosx_15_0``
+     - Google's official tarball, TensorFlow 2.18.1
+     - The library itself only requires macOS 12.0; the 15.0 wheel floor comes from the
+       Homebrew audio libraries the wheel also vendors (FFmpeg, TagLib, ...), not from
+       TensorFlow.
+   * - macOS x86_64
+     - ``macosx_15_0``
+     - Google's official tarball, TensorFlow 2.16.2
+     - 2.16.2 is the last darwin-x86_64 release Google published.
+
+A source distribution (sdist) is also published, for any platform or Python version without
+a prebuilt wheel; see `Installing from the sdist`_ below.
+
+``essentia-tensorflow`` wheels are roughly 130-155 MB per platform: they vendor the pinned
+TensorFlow C library above, so installing the package is the only thing a user does. There
+is no ``tensorflow`` pip package to install alongside it, and none is declared as a
+dependency. A TensorFlow build a user installs separately for their own code loads
+independently, with no conflict.
+
+``essentia`` vs. ``essentia-tensorflow``
+"""""""""""""""""""""""""""""""""""""""""
+
+``essentia-tensorflow`` is a superset of ``essentia``: the same package, built with
+TensorFlow inference support compiled in. Install **exactly one of the two** -- both
+install into the same ``essentia`` Python package name, so installing both in one
+environment leaves whichever was installed second shadowing the first::
+
+  pip install essentia              # no TensorFlow inference
+  # or
+  pip install essentia-tensorflow   # includes TensorFlow inference
+
+There is no separate ``essentia.tensorflow`` module, and there never has been one. When
+``essentia-tensorflow`` is the package installed, the TensorFlow algorithms
+(``TensorflowPredict``, ``TensorflowPredictEffnetDiscogs``, ``TensorflowPredictMusiCNN``,
+and the rest) simply appear alongside every other algorithm in ``essentia.standard`` and
+``essentia.streaming``::
+
+  from essentia.standard import TensorflowPredictEffnetDiscogs
+
+See `Using machine learning models <machine_learning.html>`_ for how to run inference with
+these algorithms.
+
 macOS
 -----
 The easiest way to install Essentia on macOS is by using `our Homebrew formula <https://github.com/MTG/homebrew-essentia>`_. You will need to install `Homebrew package manager <http://brew.sh>`_ first (and there are other good reasons to do so apart from Essentia).
@@ -80,7 +171,7 @@ Note that, depending on the version of Essentia, different versions of ``libav*`
 Since the 2.1-beta3 release of Essentia, the required version of TagLib (``libtag1-dev``) is greater or equal to ``1.9``.
 
 FFmpeg / LibAv version requirement
-"""""""""""""""""""""""""""""""""
+""""""""""""""""""""""""""""""""""
 
 Essentia's audio loading/writing code uses the ``AVChannelLayout`` API, which FFmpeg
 introduced in its 5.1 release. The ``configure`` step therefore requires, via pkg-config,
@@ -128,7 +219,11 @@ Install prerequisites::
 
 Install Essentia's dependencies::
 
-  brew install eigen libyaml fftw ffmpeg libsamplerate libtag chromaprint tensorflow
+  brew install eigen libyaml fftw ffmpeg libsamplerate libtag chromaprint
+
+If you also want TensorFlow inference support, see `Installing TensorFlow`_ below for how
+to provide the TensorFlow C library -- ``brew install libtensorflow``, not the much larger
+``tensorflow`` formula.
 
 `Install Python environment using Homebrew <http://docs.python-guide.org/en/latest/starting/install/osx>`_ (Note that you are advised to do as described here and there are `good reasons to do so <http://docs.python-guide.org/en/latest/starting/install/osx/>`_. You will most probably encounter installation errors when using Python/NumPy preinstalled with macOS.)::
 
@@ -141,44 +236,80 @@ Installing TensorFlow
 
 The ``TensorflowPredict*`` algorithms link against the TensorFlow C API. Essentia finds
 it with pkg-config, so whatever you install has to provide a ``tensorflow.pc``, and
-``configure --with-tensorflow`` fails if it cannot link ``TF_Version`` and
-``TF_DeleteSession`` against the libraries that ``tensorflow.pc`` names. TensorFlow 2.0
-is the minimum; the ``TensorflowPredict*`` algorithms are developed against 2.x.
+``configure --with-tensorflow`` link-tests it at configure time -- rather than leaving the
+problem to be discovered later, at import -- failing if it cannot resolve ``TF_Version``
+and ``TF_DeleteSession`` against the libraries that ``tensorflow.pc`` names. TensorFlow
+2.13 is the minimum: from that release the C API is exported by ``libtensorflow_cc`` (pip
+wheels) or ``libtensorflow`` (the standalone C library); earlier releases exported it only
+from the Python wrapper extension, which cannot be linked against.
 
-The simplest option is a packaged TensorFlow C library, which already ships a
-``tensorflow.pc``. On macOS::
+There are four ways to provide it:
 
-  brew install libtensorflow
+Packaged libtensorflow
+  The simplest option, where one exists. On macOS::
 
-If your platform has no such package, generate a ``tensorflow.pc`` from a pip
-``tensorflow`` wheel (2.13 or newer). The wheel carries the C API in
-``libtensorflow_cc`` alongside a matching header tree, and the helper script points
-pkg-config at them in place rather than copying the library::
+    brew install libtensorflow
 
-  pip3 install "tensorflow>=2.13"
-  python3 src/3rdparty/tensorflow/setup_tensorflow.py --prefix ~/.local
-  export PKG_CONFIG_PATH=~/.local/lib/pkgconfig:$PKG_CONFIG_PATH
+  Some Linux distributions package it too; check for a ``libtensorflow`` or
+  ``libtensorflow-dev`` package.
 
-Linking against the wheel's libraries is also what lets a process import both
-``essentia`` and ``tensorflow`` without the two loading separate copies of TensorFlow.
+A pip TensorFlow wheel
+  If your platform has no packaged ``libtensorflow``, generate a ``tensorflow.pc`` from a
+  pip ``tensorflow`` wheel (2.13 or newer). The wheel carries the C API in
+  ``libtensorflow_cc`` alongside a matching header tree, and the helper script points
+  pkg-config at them in place rather than copying the library::
 
-The helper writes symlinks with linker-friendly names into ``<prefix>/lib`` and the
-``tensorflow.pc`` itself into ``<prefix>/lib/pkgconfig``. Pick a prefix you own; the
-default of ``/usr/local`` needs ``sudo`` on most systems. Run
-``setup_tensorflow.py --help`` for the remaining options, including ``--package-dir``
-to point at an unpacked wheel instead of an importable package.
+    pip3 install "tensorflow>=2.13"
+    python3 src/3rdparty/tensorflow/setup_tensorflow.py --prefix ~/.local
+    export PKG_CONFIG_PATH=~/.local/lib/pkgconfig:$PKG_CONFIG_PATH
 
-You can also write your own ``tensorflow.pc`` and put its directory on
-``PKG_CONFIG_PATH``. Its ``Cflags`` must make ``<tensorflow/c/c_api.h>`` resolve, and
-its ``Libs`` must name a library that exports the C API. ``libtensorflow_framework``
-and the Python wrapper extension ``_pywrap_tensorflow_internal`` do not, on their own.
+  Linking against the wheel's libraries is also what lets a process import both
+  ``essentia`` and ``tensorflow`` without the two loading separate copies of TensorFlow.
+  The helper writes symlinks with linker-friendly names into ``<prefix>/lib`` and the
+  ``tensorflow.pc`` itself into ``<prefix>/lib/pkgconfig``. Pick a prefix you own; the
+  default of ``/usr/local`` needs ``sudo`` on most systems. Run
+  ``setup_tensorflow.py --help`` for the remaining options, including ``--package-dir``
+  to point at an unpacked wheel instead of an importable package.
+
+The reproducible path the published wheels use
+  ``packaging/fetch_libtensorflow.sh`` downloads and verifies the exact prebuilt
+  TensorFlow C library each published ``essentia-tensorflow`` wheel is built against,
+  pinned per platform in ``packaging/build_config.sh`` (see the `Supported platforms`_
+  table above)::
+
+    packaging/fetch_libtensorflow.sh --prefix ~/.local
+    export PKG_CONFIG_PATH=~/.local/lib/pkgconfig:$PKG_CONFIG_PATH
+
+  These are Google's official ``libtensorflow-cpu`` tarballs, at
+  ``https://storage.googleapis.com/tensorflow/versions/<version>/libtensorflow-cpu-<platform>.tar.gz``.
+  Google only ever published that ``versions/<version>/`` layout for TensorFlow 2.16
+  through 2.18.1 -- the channel is frozen there, on every platform where it exists, and it
+  never included a linux-arm64 build. The older
+  ``.../tensorflow/libtensorflow/libtensorflow-cpu-<platform>-<version>.tar.gz`` path was
+  retired at the same point and no longer resolves; don't probe it when checking whether a
+  given platform/version has a tarball, it will falsely look unavailable. On
+  linux/aarch64, where Google has never published a tarball under either path,
+  ``fetch_libtensorflow.sh`` instead pulls the Homebrew ``libtensorflow`` bottle. On macOS
+  x86_64, 2.16.2 is the newest version Google published a tarball for; every other platform
+  goes up to 2.18.1.
+
+Your own ``tensorflow.pc``
+  Write one and put its directory on ``PKG_CONFIG_PATH``. Its ``Cflags`` must make
+  ``<tensorflow/c/c_api.h>`` resolve, and its ``Libs`` must name a library that exports the
+  C API. ``libtensorflow_framework`` and the Python wrapper extension
+  ``_pywrap_tensorflow_internal`` do not, on their own.
 
 
 Building a wheel against a pip TensorFlow
 """""""""""""""""""""""""""""""""""""""""
 
-This part is for people packaging Essentia, not for people building it for their own
-machine. Skip it unless you are producing a wheel.
+This is a different, optional build path from the one above: the published
+``essentia-tensorflow`` wheels do **not** use it. They vendor the pinned TensorFlow C
+library from ``packaging/fetch_libtensorflow.sh`` (see above), which is what keeps
+``essentia-tensorflow`` self-contained -- no ``tensorflow`` pip package is a runtime
+dependency, and none is declared. What follows instead builds a wheel that loads
+TensorFlow from a pip install next to it, for anyone packaging their own reduced-size
+build. Skip it unless that is what you are doing.
 
 A wheel built the ordinary way carries a copy of every library it links. For the
 ``essentia-tensorflow`` wheels that is a 600 MB copy of TensorFlow, roughly 90 per cent
