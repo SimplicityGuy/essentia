@@ -40,11 +40,9 @@ LIBONNXRUNTIME_VERSION=1.22.1
 # platforms, so each names the newest release that works there and says why.
 # Every pin the wheels use lives here and nowhere else.
 
-# Linux x86_64: Google's official tarball rather than the Homebrew bottle. The
-# bottle is newer but is built against glibc 2.27, and the manylinux2014 image
-# these wheels come from is glibc 2.17, so the configure-time C API link test
-# rejects it. The tarball's highest versioned symbol requirement is GLIBC_2.17,
-# exactly what that image provides.
+# Linux x86_64: retain Google's official tarball, originally selected for
+# manylinux2014 compatibility (GLIBC_2.17). It also works with the current
+# manylinux_2_28 builder; updating the builder does not change this library pin.
 TENSORFLOW_LINUX_X86_64_VERSION=2.18.1
 TENSORFLOW_LINUX_X86_64_URL=https://storage.googleapis.com/tensorflow/versions/2.18.1/libtensorflow-cpu-linux-x86_64.tar.gz
 TENSORFLOW_LINUX_X86_64_SHA256=b692795f3ad198c531b02aeb2bc8146568d24aaf6a5dbf5faa43907c4028fd73
