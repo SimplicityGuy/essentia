@@ -68,6 +68,9 @@ jobs:
             --env ESSENTIA_SOURCE_CACHE=/ci-sources \
             --env "WITH_TENSORFLOW=$WITH_TENSORFLOW" "$DOCKER_IMAGE" \
             "${pre_cmd[@]}" /io/travis/build_wheels.sh
+          # The root container creates egg-info and wheel output in the bind
+          # mount. Restore ownership before the host's isolated sdist build.
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       - name: Build sdist
         run: |
           python -m pip install build==1.6.1

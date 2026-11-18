@@ -26,6 +26,12 @@ for candidate in /opt/python/cp3*-cp3*/bin; do
     case "$candidate" in
         */cp3[0-8]-*|*t-*) continue ;;
     esac
+    # Some old images retain beta interpreters (for example 3.11.0b3).
+    # Their headers do not match the released ABI that NumPy targets.
+    if ! "$candidate/python" -c 'import sys; sys.exit(sys.version_info.releaselevel != "final")'; then
+        echo "Skipping prerelease interpreter: $candidate"
+        continue
+    fi
     python_bins+=("$candidate")
 done
 if [[ ${#python_bins[@]} -eq 0 ]]; then
