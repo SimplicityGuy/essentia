@@ -47,8 +47,16 @@ jobs:
         run: python3 -m unittest discover -s test/ci -v
       - name: Build wheels in a Docker image
         run: |
-          docker pull $DOCKER_IMAGE > /dev/null
-          docker run --rm -v `pwd`:/io --env WITH_TENSORFLOW=$WITH_TENSORFLOW $DOCKER_IMAGE $PRE_CMD /io/travis/build_wheels.sh
+          docker pull "$DOCKER_IMAGE" > /dev/null
+          pre_cmd=()
+          if [[ -n "$PRE_CMD" ]]; then
+            pre_cmd=("$PRE_CMD")
+          fi
+          # Legacy manylinux/i686 resolvers cannot use the runner's Docker DNS
+          # forwarder reliably. These ephemeral Linux jobs have no services.
+          docker run --rm --network=host -v "$PWD:/io" \
+            --env "WITH_TENSORFLOW=$WITH_TENSORFLOW" "$DOCKER_IMAGE" \
+            "${pre_cmd[@]}" /io/travis/build_wheels.sh
       - name: Build sdist
         run: |
           python -m pip install build==1.6.1
