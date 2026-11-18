@@ -45,7 +45,6 @@ rm -r reference
 rm -r _templates/reference
 rm -r _templates/algo_description_layout_std.html
 rm -r _templates/algo_description_layout_streaming.html
-rm -r _templates/algorithms_reference.html
 
 # remove rst files generated from markdown
 rm FAQ.rst

@@ -15,6 +15,8 @@ environment = { PROJECT_NAME="essentia-tensorflow", ESSENTIA_PROJECT_NAME="${PRO
 
 # Use system's Python3 to build Essentia.
 before-all = [
+  # Match the non-TensorFlow wheel's required MetadataReader capability.
+  "pkg-config --atleast-version=1.9 taglib || (cd packaging/debian_3rdparty && PREFIX=/usr/local ./build_taglib.sh)",
   "python3 waf configure --with-gaia --with-tensorflow --build-static --static-dependencies --pkg-config-path=\"${PKG_CONFIG_PATH}\"",
   "python3 waf",
   "python3 waf install",
@@ -41,7 +43,7 @@ before-all = [
   # Tensorflow bottle has a minimum target of 15.2 which is too new.
   # We could build from source as a workaround, however, it takes too much time on the CI worker.
   # To keep it simple, just use the bottles available for tensorflow.
-  "brew install tensorflow",
+  "brew install libtensorflow",
   # ---
   # Building tensorflow from source:
   #"echo Checking available SDKs:",
@@ -77,7 +79,7 @@ before-all = [
   # Tensorflow bottle has a minimum target of 26.2 which is too new.
   # We could build from source as a workaround, however, it takes too much time on the CI worker.
   # To keep it simple, just use the bottles available for tensorflow.
-  "brew install tensorflow",
+  "brew install libtensorflow",
   # ---
   # Building tensorflow from source:
   #"echo Checking available SDKs:",

@@ -156,7 +156,9 @@ def source_links(algo_doc):
     """
     # Get build commit
     repo = git.Repo(search_parent_directories=True)
-    commit_id = repo.git.describe('--long')
+    # Forks and source checkouts may have no release tags. Source links need
+    # the immutable build commit, not a tag-derived display version.
+    commit_id = repo.head.commit.hexsha
 
     # Source Directory and URL Prefix
     URL_PREFIX = f'https://github.com/MTG/essentia/blob/{commit_id}/'

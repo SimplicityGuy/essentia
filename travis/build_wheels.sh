@@ -17,19 +17,47 @@ set -e -x
 # To prevent errors parsing version with `git describe`.
 git config --global --add safe.directory /io
 
-# We are dropping support for Python 3.4 since PyYaml is not supporting it anymore.
-# We can just remove the Python3.4 folder until ManyLinux1 drops the support too.
-rm -rf /opt/python/cp34-cp34m
-rm -rf /opt/python/cp35-cp35m
-
-# Build static libessentia.a library
-# Use Python3.6. CentOS 5's native python is too old...
-PYBIN=/opt/python/cp36-cp36m/bin/
+# The build image's system Python drives waf; do not depend on a removed
+# /opt/python/cp36 interpreter. Legacy wheels target CPython 3.9-3.13:
+# the NumPy 2.2 toolchain and TensorFlow wheels do not support 3.14.
+# Newer Python versions are built by the canonical cibuildwheel workflow.
+PYBIN="$(dirname "$(command -v python3)")"
+python_bins=()
+for candidate in /opt/python/cp3*-cp3*/bin; do
+    [[ -x "$candidate/python" ]] || continue
+    case "$candidate" in
+        */cp3[0-8]-*|*-cp3*t/bin) continue ;;
+    esac
+    # Some old images retain beta interpreters (for example 3.11.0b3).
+    # Their headers do not match the released ABI that NumPy targets.
+    if ! "$candidate/python" -c 'import sys; sys.exit(sys.version_info.releaselevel != "final" or sys.version_info >= (3, 14))'; then
+        echo "Skipping interpreter outside the legacy support range: $candidate"
+        continue
+    fi
+    python_bins+=("$candidate")
+done
+if [[ ${#python_bins[@]} -eq 0 ]]; then
+    echo "No supported CPython interpreters found in /opt/python" >&2
+    exit 1
+fi
 
 cd /io
 
+export PIP_CONSTRAINT=/io/packaging/manylinux2014-constraints.txt
+export PIP_BUILD_CONSTRAINT="$PIP_CONSTRAINT"
+
+# The legacy i686 image still contains pre-send/receive FFmpeg headers. Build
+# the repository-pinned FFmpeg when the image lacks the API used by AudioLoader.
+if ! pkg-config --atleast-version=61 libavcodec; then
+    (cd packaging/debian_3rdparty && PREFIX=/usr/local ./build_ffmpeg.sh)
+fi
+
 if [[ $WITH_TENSORFLOW ]]; then
     PROJECT_NAME='essentia-tensorflow'
+    # PEP 621 metadata overrides setup.py's environment-selected name. Match
+    # the canonical TensorFlow build's package-name preparation.
+    sed 's/^name *= *"essentia"$/name = "essentia-tensorflow"/' pyproject.toml > pyproject.toml.patched
+    mv pyproject.toml.patched pyproject.toml
     "${PYBIN}/python" waf configure --with-gaia --with-tensorflow --build-static --static-dependencies --pkg-config-path="${PKG_CONFIG_PATH}"
 else
     PROJECT_NAME='essentia'
@@ -41,36 +69,10 @@ fi
 cd -
 
 # Compile wheels
-for PYBIN in /opt/python/cp3*/bin; do
-    # Use the oldest version of numpy for each Python version
-    # for backwards compatibility of its C API
-    # https://github.com/numpy/numpy/issues/5888
-
-    # Use `oldest-supported-numpy` as a reference.
-    # https://github.com/scipy/oldest-supported-numpy/blob/main/setup.cfg
-
-    # Previously used this as a reference:
-    # https://github.com/MacPython/scikit-learn-wheels/blob/master/.travis.yml
-
-    # Python 3.x
-    if [[ $PYBIN == *"cp311"* ]]; then
-        # FIXME Not supported by NumPy yet. Update ASAP.
-        continue
-    elif [[ $PYBIN == *"cp310"* ]]; then
-        NUMPY_VERSION=1.21.4
-    elif [[ $PYBIN == *"cp39"* ]]; then
-        NUMPY_VERSION=1.19.3
-    elif [[ $PYBIN == *"cp38"* ]]; then
-        NUMPY_VERSION=1.17.4
-    elif [[ $PYBIN == *"cp37"* ]]; then
-        NUMPY_VERSION=1.14.5
-    elif [[ $PYBIN == *"cp36"* ]]; then
-        NUMPY_VERSION=1.11.3
-    # elif [[ $PYBIN == *"cp34"* ]] || [[ $PYBIN == *"cp35"* ]]; then
-    #     NUMPY_VERSION=1.9.3
-    fi
-
-    "${PYBIN}/pip" install numpy==$NUMPY_VERSION
+for PYBIN in "${python_bins[@]}"; do
+    # Resolve a supported NumPy release for each interpreter instead of old
+    # per-version pins that predate Python 3.11 and the current build backend.
+    "${PYBIN}/python" -m pip install 'numpy>=1.25'
 
     ESSENTIA_WHEEL_SKIP_3RDPARTY=1 ESSENTIA_WHEEL_ONLY_PYTHON=1 \
     ESSENTIA_PROJECT_NAME="${PROJECT_NAME}" "${PYBIN}/pip" wheel /io/ -w wheelhouse/
@@ -104,15 +106,13 @@ for whl in wheelhouse/*.whl; do
 done
 
 # Install and test
-for PYBIN in /opt/python/cp3*/bin/; do
-    if [[ $PYBIN == *"cp311"* ]]; then
-        # FIXME Not supported by NumPy yet. Skip.
-        continue
-    fi
+for PYBIN in "${python_bins[@]}"; do
     "${PYBIN}/pip" install "${PROJECT_NAME}" --no-index -f /io/wheelhouse
     if [[ $WITH_TENSORFLOW ]]; then
     # Test that essentia can be imported along with the latest TensorFlow for each Python version
-        "${PYBIN}/pip" install tensorflow
+        # Resolve wheels compatible with the legacy manylinux2014 userland.
+        # Newer dependency sdists need system libraries/toolchains absent here.
+        "${PYBIN}/pip" install --only-binary=:all: tensorflow
         (cd "$HOME"; ${PYBIN}/python -c 'import essentia; import essentia.standard; import essentia.streaming; import tensorflow')
     else
         (cd "$HOME"; ${PYBIN}/python -c 'import essentia; import essentia.standard; import essentia.streaming')
