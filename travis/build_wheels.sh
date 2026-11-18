@@ -18,18 +18,20 @@ set -e -x
 git config --global --add safe.directory /io
 
 # The build image's system Python drives waf; do not depend on a removed
-# /opt/python/cp36 interpreter. Wheels require Python >=3.9 (NumPy >=1.25).
+# /opt/python/cp36 interpreter. Legacy wheels target CPython 3.9-3.13:
+# the NumPy 2.2 toolchain and TensorFlow wheels do not support 3.14.
+# Newer Python versions are built by the canonical cibuildwheel workflow.
 PYBIN="$(dirname "$(command -v python3)")"
 python_bins=()
 for candidate in /opt/python/cp3*-cp3*/bin; do
     [[ -x "$candidate/python" ]] || continue
     case "$candidate" in
-        */cp3[0-8]-*|*t-*) continue ;;
+        */cp3[0-8]-*|*-cp3*t/bin) continue ;;
     esac
     # Some old images retain beta interpreters (for example 3.11.0b3).
     # Their headers do not match the released ABI that NumPy targets.
-    if ! "$candidate/python" -c 'import sys; sys.exit(sys.version_info.releaselevel != "final")'; then
-        echo "Skipping prerelease interpreter: $candidate"
+    if ! "$candidate/python" -c 'import sys; sys.exit(sys.version_info.releaselevel != "final" or sys.version_info >= (3, 14))'; then
+        echo "Skipping interpreter outside the legacy support range: $candidate"
         continue
     fi
     python_bins+=("$candidate")
@@ -52,6 +54,10 @@ fi
 
 if [[ $WITH_TENSORFLOW ]]; then
     PROJECT_NAME='essentia-tensorflow'
+    # PEP 621 metadata overrides setup.py's environment-selected name. Match
+    # the canonical TensorFlow build's package-name preparation.
+    sed 's/^name *= *"essentia"$/name = "essentia-tensorflow"/' pyproject.toml > pyproject.toml.patched
+    mv pyproject.toml.patched pyproject.toml
     "${PYBIN}/python" waf configure --with-gaia --with-tensorflow --build-static --static-dependencies --pkg-config-path="${PKG_CONFIG_PATH}"
 else
     PROJECT_NAME='essentia'
