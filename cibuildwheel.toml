@@ -13,6 +13,8 @@ environment = { PROJECT_NAME="essentia", ESSENTIA_PROJECT_NAME="${PROJECT_NAME}"
 
 # Use system's Python3 to build Essentia.
 before-all = [
+  # The manylinux_2_28 image omits TagLib; keep MetadataReader in the wheels.
+  "pkg-config --atleast-version=1.9 taglib || (cd packaging/debian_3rdparty && PREFIX=/usr/local ./build_taglib.sh)",
   "python3 waf configure --with-gaia --build-static --static-dependencies --pkg-config-path=\"${PKG_CONFIG_PATH}\"",
   "python3 waf",
   "python3 waf install",

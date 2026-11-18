@@ -415,4 +415,6 @@ def doc(ctx):
 
     pythonpath = os.path.abspath('build/python')
     ldpath = os.path.join(pythonpath, 'essentia')
-    os.system('PYTHONPATH=%s LD_LIBRARY_PATH=%s doc/build_sphinx_doc.sh %s' % (pythonpath, ldpath, sys.executable))
+    ret = os.system('PYTHONPATH=%s LD_LIBRARY_PATH=%s doc/build_sphinx_doc.sh %s' % (pythonpath, ldpath, sys.executable))
+    if ret:
+        ctx.fatal('Failed to build documentation. Check Sphinx output')

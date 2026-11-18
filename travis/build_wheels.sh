@@ -17,14 +17,21 @@ set -e -x
 # To prevent errors parsing version with `git describe`.
 git config --global --add safe.directory /io
 
-# We are dropping support for Python 3.4 since PyYaml is not supporting it anymore.
-# We can just remove the Python3.4 folder until ManyLinux1 drops the support too.
-rm -rf /opt/python/cp34-cp34m
-rm -rf /opt/python/cp35-cp35m
-
-# Build static libessentia.a library
-# Use Python3.6. CentOS 5's native python is too old...
-PYBIN=/opt/python/cp36-cp36m/bin/
+# The build image's system Python drives waf; do not depend on a removed
+# /opt/python/cp36 interpreter. Wheels require Python >=3.9 (NumPy >=1.25).
+PYBIN="$(dirname "$(command -v python3)")"
+python_bins=()
+for candidate in /opt/python/cp3*-cp3*/bin; do
+    [[ -x "$candidate/python" ]] || continue
+    case "$candidate" in
+        */cp3[0-8]-*|*t-*) continue ;;
+    esac
+    python_bins+=("$candidate")
+done
+if [[ ${#python_bins[@]} -eq 0 ]]; then
+    echo "No supported CPython interpreters found in /opt/python" >&2
+    exit 1
+fi
 
 cd /io
 
@@ -41,36 +48,10 @@ fi
 cd -
 
 # Compile wheels
-for PYBIN in /opt/python/cp3*/bin; do
-    # Use the oldest version of numpy for each Python version
-    # for backwards compatibility of its C API
-    # https://github.com/numpy/numpy/issues/5888
-
-    # Use `oldest-supported-numpy` as a reference.
-    # https://github.com/scipy/oldest-supported-numpy/blob/main/setup.cfg
-
-    # Previously used this as a reference:
-    # https://github.com/MacPython/scikit-learn-wheels/blob/master/.travis.yml
-
-    # Python 3.x
-    if [[ $PYBIN == *"cp311"* ]]; then
-        # FIXME Not supported by NumPy yet. Update ASAP.
-        continue
-    elif [[ $PYBIN == *"cp310"* ]]; then
-        NUMPY_VERSION=1.21.4
-    elif [[ $PYBIN == *"cp39"* ]]; then
-        NUMPY_VERSION=1.19.3
-    elif [[ $PYBIN == *"cp38"* ]]; then
-        NUMPY_VERSION=1.17.4
-    elif [[ $PYBIN == *"cp37"* ]]; then
-        NUMPY_VERSION=1.14.5
-    elif [[ $PYBIN == *"cp36"* ]]; then
-        NUMPY_VERSION=1.11.3
-    # elif [[ $PYBIN == *"cp34"* ]] || [[ $PYBIN == *"cp35"* ]]; then
-    #     NUMPY_VERSION=1.9.3
-    fi
-
-    "${PYBIN}/pip" install numpy==$NUMPY_VERSION
+for PYBIN in "${python_bins[@]}"; do
+    # Resolve a supported NumPy release for each interpreter instead of old
+    # per-version pins that predate Python 3.11 and the current build backend.
+    "${PYBIN}/python" -m pip install 'numpy>=1.25'
 
     ESSENTIA_WHEEL_SKIP_3RDPARTY=1 ESSENTIA_WHEEL_ONLY_PYTHON=1 \
     ESSENTIA_PROJECT_NAME="${PROJECT_NAME}" "${PYBIN}/pip" wheel /io/ -w wheelhouse/
@@ -104,11 +85,7 @@ for whl in wheelhouse/*.whl; do
 done
 
 # Install and test
-for PYBIN in /opt/python/cp3*/bin/; do
-    if [[ $PYBIN == *"cp311"* ]]; then
-        # FIXME Not supported by NumPy yet. Skip.
-        continue
-    fi
+for PYBIN in "${python_bins[@]}"; do
     "${PYBIN}/pip" install "${PROJECT_NAME}" --no-index -f /io/wheelhouse
     if [[ $WITH_TENSORFLOW ]]; then
     # Test that essentia can be imported along with the latest TensorFlow for each Python version
