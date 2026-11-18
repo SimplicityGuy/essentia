@@ -14,7 +14,7 @@ rm -rf tmp
 mkdir tmp
 cd tmp
 
-curl -SLO https://ffmpeg.org/releases/$FFMPEG_VERSION.tar.gz
+curl -fSLO "https://ffmpeg.org/releases/$FFMPEG_VERSION.tar.gz"
 tar xf $FFMPEG_VERSION.tar.gz
 cd $FFMPEG_VERSION
 

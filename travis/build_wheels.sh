@@ -35,6 +35,12 @@ fi
 
 cd /io
 
+# The legacy i686 image still contains pre-send/receive FFmpeg headers. Build
+# the repository-pinned FFmpeg when the image lacks the API used by AudioLoader.
+if ! pkg-config --atleast-version=61 libavcodec; then
+    (cd packaging/debian_3rdparty && PREFIX=/usr/local ./build_ffmpeg.sh)
+fi
+
 if [[ $WITH_TENSORFLOW ]]; then
     PROJECT_NAME='essentia-tensorflow'
     "${PYBIN}/python" waf configure --with-gaia --with-tensorflow --build-static --static-dependencies --pkg-config-path="${PKG_CONFIG_PATH}"
