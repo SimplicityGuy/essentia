@@ -1,0 +1,4 @@
+# NumPy 2.5 requires GCC >=10.3; this legacy image contains GCC 10.2.1.
+# Keep its build/runtime test environment on the reviewed NumPy 2.2 line.
+# The modern cibuildwheel configurations use their own toolchains.
+numpy<2.3

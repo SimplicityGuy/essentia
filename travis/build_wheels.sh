@@ -35,6 +35,9 @@ fi
 
 cd /io
 
+export PIP_CONSTRAINT=/io/packaging/manylinux2014-constraints.txt
+export PIP_BUILD_CONSTRAINT="$PIP_CONSTRAINT"
+
 # The legacy i686 image still contains pre-send/receive FFmpeg headers. Build
 # the repository-pinned FFmpeg when the image lacks the API used by AudioLoader.
 if ! pkg-config --atleast-version=61 libavcodec; then
