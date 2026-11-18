@@ -62,7 +62,15 @@ jobs:
             "https://ffmpeg.org/releases/$ffmpeg_version.tar.gz"
           checksum_manifest="$PWD/packaging/ffmpeg-source.sha256"
           (cd "$source_cache" && sha256sum --check "$checksum_manifest")
-          docker run --rm -v "$PWD:/io" -v "$source_cache:/ci-sources:ro" \
+          # PyPI has the same resolver failure in the old 32-bit image. Use
+          # host-resolved addresses while retaining HTTPS hostname verification.
+          package_hosts=()
+          for package_host in pypi.org files.pythonhosted.org; do
+            package_ip="$(getent ahostsv4 "$package_host" | awk 'NR == 1 { print $1 }')"
+            test -n "$package_ip"
+            package_hosts+=(--add-host "$package_host:$package_ip")
+          done
+          docker run --rm "${package_hosts[@]}" -v "$PWD:/io" -v "$source_cache:/ci-sources:ro" \
             --env ESSENTIA_SOURCE_CACHE=/ci-sources \
             --env "WITH_TENSORFLOW=$WITH_TENSORFLOW" "$DOCKER_IMAGE" \
             "${pre_cmd[@]}" /io/travis/build_wheels.sh
