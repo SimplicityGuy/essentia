@@ -14,7 +14,11 @@ rm -rf tmp
 mkdir tmp
 cd tmp
 
-curl -fSLO "https://ffmpeg.org/releases/$FFMPEG_VERSION.tar.gz"
+if [[ -n "${ESSENTIA_SOURCE_CACHE:-}" && -f "$ESSENTIA_SOURCE_CACHE/$FFMPEG_VERSION.tar.gz" ]]; then
+  cp "$ESSENTIA_SOURCE_CACHE/$FFMPEG_VERSION.tar.gz" .
+else
+  curl -fSLO "https://ffmpeg.org/releases/$FFMPEG_VERSION.tar.gz"
+fi
 tar xf $FFMPEG_VERSION.tar.gz
 cd $FFMPEG_VERSION
 

@@ -52,9 +52,18 @@ jobs:
           if [[ -n "$PRE_CMD" ]]; then
             pre_cmd=("$PRE_CMD")
           fi
-          # Legacy manylinux/i686 resolvers cannot use the runner's Docker DNS
-          # forwarder reliably. These ephemeral Linux jobs have no services.
-          docker run --rm --network=host -v "$PWD:/io" \
+          # Download on the current host: the legacy i686 image cannot resolve
+          # ffmpeg.org, even with host networking. Verify before mounting read-only.
+          ffmpeg_version="$(sed -n 's/^FFMPEG_VERSION=//p' packaging/build_config.sh)"
+          source_cache="$RUNNER_TEMP/essentia-sources"
+          mkdir -p "$source_cache"
+          curl --fail --show-error --location --retry 3 \
+            --output "$source_cache/$ffmpeg_version.tar.gz" \
+            "https://ffmpeg.org/releases/$ffmpeg_version.tar.gz"
+          checksum_manifest="$PWD/packaging/ffmpeg-source.sha256"
+          (cd "$source_cache" && sha256sum --check "$checksum_manifest")
+          docker run --rm -v "$PWD:/io" -v "$source_cache:/ci-sources:ro" \
+            --env ESSENTIA_SOURCE_CACHE=/ci-sources \
             --env "WITH_TENSORFLOW=$WITH_TENSORFLOW" "$DOCKER_IMAGE" \
             "${pre_cmd[@]}" /io/travis/build_wheels.sh
       - name: Build sdist
