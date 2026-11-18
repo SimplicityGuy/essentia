@@ -110,7 +110,9 @@ for PYBIN in "${python_bins[@]}"; do
     "${PYBIN}/pip" install "${PROJECT_NAME}" --no-index -f /io/wheelhouse
     if [[ $WITH_TENSORFLOW ]]; then
     # Test that essentia can be imported along with the latest TensorFlow for each Python version
-        "${PYBIN}/pip" install tensorflow
+        # Resolve wheels compatible with the legacy manylinux2014 userland.
+        # Newer dependency sdists need system libraries/toolchains absent here.
+        "${PYBIN}/pip" install --only-binary=:all: tensorflow
         (cd "$HOME"; ${PYBIN}/python -c 'import essentia; import essentia.standard; import essentia.streaming; import tensorflow')
     else
         (cd "$HOME"; ${PYBIN}/python -c 'import essentia; import essentia.standard; import essentia.streaming')
